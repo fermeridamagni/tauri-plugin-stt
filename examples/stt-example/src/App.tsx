@@ -1,163 +1,171 @@
-import { useState, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  Alert,
   Box,
   Button,
-  Typography,
-  Paper,
-  Stack,
-  Alert,
+  Chip,
   CircularProgress,
-  ToggleButton,
-  ToggleButtonGroup,
+  Container,
+  Divider,
+  FormControl,
+  IconButton,
+  InputLabel,
   List,
   ListItem,
   ListItemText,
-  Chip,
-  TextField,
-  FormControlLabel,
-  Switch,
-  Container,
+  MenuItem,
+  Paper,
+  Select,
+  Stack,
+  Tooltip,
+  Typography,
 } from "@mui/material";
 import {
-  startListening,
-  stopListening,
-  isAvailable as sttIsAvailable,
-  getSupportedLanguages,
   checkPermission as sttCheckPermission,
-  requestPermission as sttRequestPermission,
+  getSupportedLanguages,
+  installModel,
+  isAvailable as sttIsAvailable,
+  listModels,
+  onDownloadProgress,
+  onError,
   onResult,
   onStateChange,
-  onError,
-  type SttError,
+  removeModel,
+  requestPermission as sttRequestPermission,
+  setActiveModel,
+  startListening,
+  stopListening,
+  type DownloadProgressEvent,
+  type RecognitionState,
+  type SupportedLanguage,
+  type WhisperModelInfo,
 } from "tauri-plugin-stt-api";
 import {
-  MdMic,
-  MdStop,
   MdCheckCircle,
+  MdDelete,
+  MdDownload,
   MdError,
+  MdMic,
   MdRefresh,
+  MdStar,
+  MdStarBorder,
+  MdStop,
 } from "react-icons/md";
 
+const NO_MODEL_HINT = /no whisper model/i;
+
+type PermState = { microphone: string; speechRecognition: string } | null;
+
+type ResultRow = {
+  text: string;
+  confidence?: number;
+  timestamp: Date;
+  audioUrl?: string;
+};
+
+const formatBytes = (bytes: number) => {
+  if (bytes <= 0) return "0 MB";
+  const mb = bytes / (1024 * 1024);
+  return mb < 1024 ? `${mb.toFixed(1)} MB` : `${(mb / 1024).toFixed(2)} GB`;
+};
+
+const permColor = (status: string) =>
+  status === "granted" ? "success" : status === "denied" ? "error" : "warning";
+
 export default function App() {
-  // STT state
-  const [isListening, setIsListening] = useState(false);
+  // Recognition state
+  // Empty string = "auto-detect" (no language sent → Whisper detects from
+  // audio). Guessing from `navigator.language` was misleading on browsers
+  // that report locales Whisper doesn't actually transcribe well.
+  const [language, setLanguage] = useState<string>("");
+  const [recognitionState, setRecognitionState] = useState<RecognitionState>("idle");
   const [transcript, setTranscript] = useState<string>("");
-  const [partialTranscript, setPartialTranscript] = useState<string>("");
-  const [language, setLanguage] = useState<string>("en-US");
-  const [availableLanguages, setAvailableLanguages] = useState<
-    Array<{ code: string; name: string; installed?: boolean }>
-  >([]);
-  const [interimResults, setInterimResults] = useState(true);
-  const [continuous, setContinuous] = useState(true);
-  const [maxAlternatives, setMaxAlternatives] = useState(1);
+  const [results, setResults] = useState<ResultRow[]>([]);
+  /** Object URL of the most recent recording for the top-level player. */
+  const [latestAudioUrl, setLatestAudioUrl] = useState<string | null>(null);
 
-  // UI state
   const [isAvailable, setIsAvailable] = useState<boolean | null>(null);
-  const [availabilityReason, setAvailabilityReason] = useState<string | null>(
-    null
-  );
-  const [permission, setPermission] = useState<{
-    microphone: string;
-    speechRecognition: string;
-  } | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [availabilityReason, setAvailabilityReason] = useState<string | null>(null);
+  const [permission, setPermission] = useState<PermState>(null);
+  const [availableLanguages, setAvailableLanguages] = useState<SupportedLanguage[]>([]);
+
+  const [models, setModels] = useState<WhisperModelInfo[]>([]);
+  const [activeModelId, setActiveModelId] = useState<string | null>(null);
+  const [totalDiskBytes, setTotalDiskBytes] = useState(0);
+  const [systemMemoryMb, setSystemMemoryMb] = useState(0);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [installingId, setInstallingId] = useState<string | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgressEvent | null>(null);
+
   const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
-
-  // Download progress state
-  const [downloadProgress, setDownloadProgress] = useState<{
-    status: string;
-    model: string;
-    progress: number;
-  } | null>(null);
-
-  // Results history
-  const [results, setResults] = useState<
-    Array<{
-      text: string;
-      isFinal: boolean;
-      confidence?: number;
-      timestamp: Date;
-    }>
-  >([]);
+  const [info, setInfo] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false); // start/stop button spinner
 
   const resultsEndRef = useRef<HTMLDivElement>(null);
+  /** Holds all Blob object URLs so we can revoke them on clear/unmount. */
+  const audioUrlsRef = useRef<string[]>([]);
 
-  // Scroll to bottom when new results arrive
+  // Revoke all Blob URLs created so far.
+  const revokeAllAudioUrls = useCallback(() => {
+    for (const url of audioUrlsRef.current) URL.revokeObjectURL(url);
+    audioUrlsRef.current = [];
+  }, []);
+
+  // Revoke on unmount.
+  useEffect(() => revokeAllAudioUrls, [revokeAllAudioUrls]);
+
   useEffect(() => {
     resultsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [results]);
-
-  // Check availability and load languages on mount
-  useEffect(() => {
-    checkAvailability();
-  }, []);
-
-  // Load languages and check permissions only when STT is available
-  useEffect(() => {
-    if (isAvailable === true) {
-      loadLanguages();
-      checkPerm();
-    }
-  }, [isAvailable]);
-
-  // Listen for download progress events
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-
-    const setupListener = async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen<{
-        status: string;
-        model: string;
-        progress: number;
-      }>("stt://download-progress", event => {
-        setDownloadProgress(event.payload);
-        if (event.payload.status === "complete") {
-          setSuccess(`Model ${event.payload.model} downloaded successfully!`);
-          setTimeout(() => {
-            setDownloadProgress(null);
-            setSuccess(null);
-            loadLanguages(); // Refresh languages to show installed status
-          }, 2000);
-        }
-      });
-    };
-
-    setupListener();
-
-    return () => {
-      if (unlisten) unlisten();
-    };
-  }, []);
-
-  const checkAvailability = async () => {
+  const checkAvailability = useCallback(async () => {
     try {
       const result = await sttIsAvailable();
       setIsAvailable(result.available);
-      setAvailabilityReason(result.reason || null);
-
-      if (result.available) {
-        setSuccess("STT is available!");
-        setTimeout(() => setSuccess(null), 3000);
-      } else {
-        setError(result.reason || "STT is not available");
+      setAvailabilityReason(result.reason ?? null);
+      // The "no model installed" reason is expected on first run; the
+      // model manager card already speaks to it, so don't surface a red
+      // error toast for it.
+      if (!result.available && result.reason && !NO_MODEL_HINT.test(result.reason)) {
+        setError(result.reason);
       }
     } catch (err) {
-      const errorMsg = String(err);
-      if (errorMsg.includes("Plugin not found")) {
-        setError(
-          "STT plugin is not enabled. Build with --features stt to enable it."
-        );
+      const msg = String(err);
+      if (msg.includes("Plugin not found")) {
+        setError("STT plugin is not enabled. Build with --features stt to enable it.");
         setAvailabilityReason("Plugin not compiled with STT support");
       } else {
         setError(`Failed to check availability: ${err}`);
       }
       setIsAvailable(false);
     }
-  };
+  }, []);
 
-  const checkPerm = async () => {
+  const refreshModels = useCallback(async () => {
+    try {
+      const resp = await listModels(showAdvanced);
+      setModels(resp.models);
+      setActiveModelId(resp.active ?? null);
+      setTotalDiskBytes(resp.totalDiskBytes);
+      setSystemMemoryMb(resp.systemMemoryMb);
+    } catch (err) {
+      if (!String(err).includes("Plugin not found")) {
+        setError(`Failed to load models: ${err}`);
+      }
+    }
+  }, [showAdvanced]);
+
+  const loadLanguages = useCallback(async () => {
+    try {
+      const resp = await getSupportedLanguages();
+      setAvailableLanguages(resp.languages);
+    } catch (err) {
+      if (!String(err).includes("Plugin not found")) {
+        setError(`Failed to load languages: ${err}`);
+      }
+    }
+  }, []);
+
+  const checkPerm = useCallback(async () => {
     try {
       const perm = await sttCheckPermission();
       setPermission({
@@ -165,13 +173,128 @@ export default function App() {
         speechRecognition: perm.speechRecognition,
       });
     } catch (err) {
-      // Silently fail if plugin not available - will be caught by checkAvailability
       if (!String(err).includes("Plugin not found")) {
         setError(`Failed to check permission: ${err}`);
       }
     }
-  };
+  }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    const pending: Array<Promise<unknown>> = [];
+    const unlistens: Array<() => void> = [];
+
+    const callUnlisten = (l: unknown) => {
+      if (!l) return;
+      if (typeof l === "function") (l as () => void)();
+      else if (
+        typeof l === "object" &&
+        l !== null &&
+        typeof (l as { unregister?: () => void }).unregister === "function"
+      )
+        (l as { unregister: () => void }).unregister();
+    };
+
+    const track = <T,>(p: Promise<T>) => {
+      pending.push(
+        p.then((fn) => {
+          if (cancelled) callUnlisten(fn);
+          else unlistens.push(() => callUnlisten(fn));
+        }),
+      );
+    };
+
+    track(
+      onResult((result) => {
+        const text = result.transcript.trim();
+        if (!text) {
+          setInfo(
+            "No speech detected. Try recording a longer clip — or check the language is correct.",
+          );
+          setTimeout(() => setInfo(null), 4000);
+          return;
+        }
+        setTranscript((prev) => (prev ? `${prev} ${text}` : text));
+        // Convert base64 WAV → Blob URL for in-app playback (desktop only).
+        let audioUrl: string | undefined;
+        if (result.audioData) {
+          try {
+            const bytes = Uint8Array.from(atob(result.audioData), (c) =>
+              c.charCodeAt(0),
+            );
+            audioUrl = URL.createObjectURL(
+              new Blob([bytes], { type: "audio/wav" }),
+            );
+            audioUrlsRef.current.push(audioUrl);
+            setLatestAudioUrl(audioUrl);
+          } catch {
+            // Non-fatal: just won't show a player for this result.
+          }
+        }
+        setResults((prev) => [
+          ...prev,
+          { text, confidence: result.confidence, timestamp: new Date(), audioUrl },
+        ]);
+      }),
+    );
+
+    track(
+      onStateChange((event) => {
+        setRecognitionState(event.state);
+      }),
+    );
+
+    track(
+      onError((err) => {
+        console.error("STT error:", err);
+        setError(`STT Error: ${err.message ?? err.code ?? String(err)}`);
+        setBusy(false);
+      }),
+    );
+
+    track(
+      onDownloadProgress((event) => {
+        setDownloadProgress(event);
+        if (event.status === "complete") {
+          setInfo(`Model ${event.modelId ?? event.model} downloaded!`);
+          setTimeout(() => {
+            setDownloadProgress(null);
+            setInfo(null);
+          }, 1500);
+          refreshModels();
+          checkAvailability();
+        } else if (event.status === "error") {
+          setError(`Download failed: ${event.message ?? "unknown error"}`);
+          setDownloadProgress(null);
+        }
+      }),
+    );
+
+    return () => {
+      cancelled = true;
+      for (const u of unlistens) u();
+      // Anything still in-flight will be cleaned up when its promise
+      // resolves (see the `cancelled` check inside `track`).
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // First availability probe.
+  useEffect(() => {
+    checkAvailability();
+  }, [checkAvailability]);
+
+  // After availability resolves, always load the model catalogue (the
+  // user may need to install one) and load languages/permissions when
+  // the plugin is actually usable.
+  useEffect(() => {
+    if (isAvailable === null) return;
+    refreshModels();
+    if (isAvailable) {
+      loadLanguages();
+      checkPerm();
+    }
+  }, [isAvailable, refreshModels, loadLanguages, checkPerm]);
   const handleRequestPermission = async () => {
     try {
       const perm = await sttRequestPermission();
@@ -179,161 +302,114 @@ export default function App() {
         microphone: perm.microphone,
         speechRecognition: perm.speechRecognition,
       });
-
       if (perm.microphone === "granted") {
-        setSuccess("Permission granted!");
-        setTimeout(() => setSuccess(null), 3000);
+        setInfo("Permission granted!");
+        setTimeout(() => setInfo(null), 2000);
       }
     } catch (err) {
       setError(`Failed to request permission: ${err}`);
     }
   };
 
-  const loadLanguages = async () => {
+  const handleInstallModel = async (id: string) => {
+    setError(null);
+    setInstallingId(id);
+    setDownloadProgress({
+      status: "downloading",
+      modelId: id,
+      model: id,
+      progress: 0,
+    });
     try {
-      const result = await getSupportedLanguages();
-      setAvailableLanguages(result.languages);
+      await installModel(id);
     } catch (err) {
-      // Only show error if it's not about plugin not being available
-      if (!String(err).includes("Plugin not found")) {
-        setError(`Failed to load languages: ${err}`);
-      }
+      setError(`Install failed: ${err}`);
+      setDownloadProgress(null);
+    } finally {
+      setInstallingId(null);
     }
   };
 
-  const handleStartListening = async () => {
+  const handleRemoveModel = async (id: string) => {
     setError(null);
-    setLoading(true);
-    setPartialTranscript("");
-
     try {
-      // Register listeners for STT events using the guest SDK helpers
-      const resultListener = await onResult(result => {
-        const { transcript: text, isFinal, confidence } = result;
-
-        if (isFinal) {
-          // Apenas resultados finais são adicionados ao histórico e transcrição
-          setTranscript(prev => prev + (prev ? " " : "") + text);
-          setPartialTranscript("");
-          setResults(prev => [
-            ...prev,
-            {
-              text,
-              isFinal: true,
-              confidence,
-              timestamp: new Date(),
-            },
-          ]);
-        } else {
-          // Resultados parciais apenas atualizam o display, não entram no histórico
-          setPartialTranscript(text);
-        }
-      });
-
-      const stateListener = await onStateChange(() => {
-        // State changes tracked silently
-      });
-
-      // Listen for errors
-      const errorListener = await onError((errorEvent: SttError) => {
-        console.error("STT error:", errorEvent);
-        setError(
-          `STT Error: ${errorEvent.message ?? errorEvent.code ?? String(errorEvent)}`
-        );
-        setLoading(false);
-      });
-
-      // Store listeners for cleanup on stop
-      (
-        window as unknown as {
-          sttListeners?: ((() => void) | { unregister?: () => void })[];
-        }
-      ).sttListeners = [resultListener, stateListener, errorListener];
-
-      // Start listening
-      await startListening({
-        language,
-        interimResults: interimResults,
-        continuous,
-      });
-
-      setIsListening(true);
-      setSuccess("Started listening");
-      setTimeout(() => setSuccess(null), 2000);
+      await removeModel(id);
+      setInfo(`Removed ${id}`);
+      setTimeout(() => setInfo(null), 1500);
+      await refreshModels();
+      await checkAvailability();
     } catch (err) {
-      const errorMessage = String(err);
-      if (errorMessage.includes("permission")) {
+      setError(`Remove failed: ${err}`);
+    }
+  };
+
+  const handleSetActive = async (id: string) => {
+    setError(null);
+    try {
+      await setActiveModel(id);
+      setActiveModelId(id);
+      setInfo(`${id} is now the active model`);
+      setTimeout(() => setInfo(null), 1500);
+      await refreshModels();
+      await checkAvailability();
+    } catch (err) {
+      setError(`Set active failed: ${err}`);
+    }
+  };
+
+  const handleStart = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      await startListening({
+        // `undefined` → backend uses Whisper's auto-detect (LANG_AUTO).
+        language: language || undefined,
+      });
+      // recognitionState will flip to "listening" via the state listener.
+      setInfo("Listening… speak, then press Stop.");
+      setTimeout(() => setInfo(null), 2500);
+    } catch (err) {
+      const msg = String(err);
+      if (NO_MODEL_HINT.test(msg)) {
         setError(
-          `Permissão necessária: ${err}. Por favor, conceda a permissão e tente novamente.`
+          "No Whisper model installed yet. Install one from the Whisper Models panel above.",
         );
+      } else if (msg.includes("permission")) {
+        setError(`Permission required: ${err}`);
       } else {
         setError(`Failed to start listening: ${err}`);
       }
-      setIsListening(false);
     } finally {
-      setLoading(false);
+      setBusy(false);
     }
   };
 
-  const handleStopListening = async () => {
-    setLoading(true);
+  const handleStop = async () => {
+    setBusy(true);
     try {
       await stopListening();
-
-      // Clean up listeners
-      const listeners = (
-        window as unknown as {
-          sttListeners?: (() => void)[];
-        }
-      ).sttListeners;
-      if (listeners) {
-        for (const listener of listeners) {
-          if (typeof listener === "function") {
-            listener();
-          } else if (
-            listener &&
-            typeof (listener as { unregister?: () => void }).unregister ===
-              "function"
-          ) {
-            (listener as { unregister: () => void }).unregister();
-          }
-        }
-        (window as unknown as { sttListeners?: unknown[] }).sttListeners =
-          undefined;
-      }
-
-      setIsListening(false);
-      setPartialTranscript("");
-      setSuccess("Stopped listening");
-      setTimeout(() => setSuccess(null), 2000);
     } catch (err) {
       setError(`Failed to stop listening: ${err}`);
     } finally {
-      setLoading(false);
+      setBusy(false);
     }
   };
 
-  const handleClearResults = () => {
+  const handleClear = () => {
     setTranscript("");
-    setPartialTranscript("");
     setResults([]);
-    setSuccess("Cleared results");
-    setTimeout(() => setSuccess(null), 2000);
+    revokeAllAudioUrls();
+    setLatestAudioUrl(null);
   };
 
-  const getPermissionColor = (status: string) => {
-    switch (status) {
-      case "granted":
-        return "success";
-      case "denied":
-        return "error";
-      default:
-        return "warning";
-    }
-  };
+  const hasInstalledModel = models.some((m) => m.installed);
+  const isListening = recognitionState === "listening";
+  const isProcessing = recognitionState === "processing";
+  const canListen = isAvailable === true && !!activeModelId && !installingId && !isProcessing;
 
   return (
     <Container maxWidth="md" sx={{ py: { xs: 2, sm: 3, md: 4 } }}>
+      {/* Header ---------------------------------------------------------- */}
       <Paper
         elevation={0}
         sx={{
@@ -353,17 +429,11 @@ export default function App() {
             mb: 1,
           }}
         >
-          🎤 Speech-to-Text Example
+          🎤 Speech-to-Text Example (Whisper)
         </Typography>
-        <Typography
-          variant="body2"
-          sx={{
-            fontSize: { xs: "0.875rem", sm: "1rem" },
-            opacity: 0.9,
-            display: { xs: "none", sm: "block" },
-          }}
-        >
-          Test the native Speech-to-Text plugin functionality
+        <Typography variant="body2" sx={{ opacity: 0.9 }}>
+          Whisper is <strong>record-then-transcribe</strong>: press Start, speak your sentence,
+          then press Stop. The model runs locally and emits the final transcript a moment later.
         </Typography>
       </Paper>
 
@@ -372,62 +442,56 @@ export default function App() {
           {error}
         </Alert>
       )}
-      {success && (
-        <Alert
-          severity="success"
-          sx={{ mb: 2 }}
-          onClose={() => setSuccess(null)}
-        >
-          {success}
+      {info && (
+        <Alert severity="info" sx={{ mb: 2 }} onClose={() => setInfo(null)}>
+          {info}
         </Alert>
       )}
 
       <Stack spacing={{ xs: 2, sm: 3 }}>
+        {/* Download progress ------------------------------------------- */}
         {downloadProgress && (
           <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-            <Stack spacing={{ xs: 1.5, sm: 2 }}>
-              <Box sx={{ display: "flex", alignItems: "center", gap: 2 }}>
-                <CircularProgress size={24} />
-                <Box sx={{ flex: 1 }}>
-                  <Typography
-                    sx={{
-                      color: "white",
-                      fontSize: { xs: "0.875rem", sm: "1rem" },
-                    }}
-                  >
-                    {downloadProgress.status === "downloading"
-                      ? `Downloading ${downloadProgress.model}...`
-                      : downloadProgress.status === "extracting"
-                        ? `Extracting ${downloadProgress.model}...`
-                        : `${downloadProgress.model} ready!`}
-                  </Typography>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 2 }}>
+              <CircularProgress
+                size={24}
+                variant={(downloadProgress.progress ?? 0) > 0 ? "determinate" : "indeterminate"}
+                value={downloadProgress.progress ?? 0}
+              />
+              <Box sx={{ flex: 1 }}>
+                <Typography>
+                  {downloadProgress.status === "downloading"
+                    ? `Downloading ${downloadProgress.modelId ?? downloadProgress.model}… ${downloadProgress.progress ?? 0}%`
+                    : downloadProgress.status === "complete"
+                      ? `${downloadProgress.modelId ?? downloadProgress.model} ready!`
+                      : `Error downloading ${downloadProgress.model}`}
+                </Typography>
+                <Box
+                  sx={{
+                    mt: 1,
+                    height: 4,
+                    bgcolor: "rgba(0,0,0,0.1)",
+                    borderRadius: 2,
+                  }}
+                >
                   <Box
                     sx={{
-                      mt: 1,
-                      height: 4,
-                      bgcolor: "rgba(255,255,255,0.2)",
+                      width: `${downloadProgress.progress ?? 0}%`,
+                      height: "100%",
+                      bgcolor: downloadProgress.status === "error" ? "#ef4444" : "#22c55e",
                       borderRadius: 2,
+                      transition: "width 0.3s",
                     }}
-                  >
-                    <Box
-                      sx={{
-                        width: `${downloadProgress.progress}%`,
-                        height: "100%",
-                        bgcolor: "#22c55e",
-                        borderRadius: 2,
-                        transition: "width 0.3s",
-                      }}
-                    />
-                  </Box>
+                  />
                 </Box>
               </Box>
-            </Stack>
+            </Box>
           </Paper>
         )}
 
-        {/* Availability Status */}
+        {/* Availability  */}
         <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-          <Stack spacing={{ xs: 1.5, sm: 2 }}>
+          <Stack spacing={1.5}>
             <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
               {isAvailable === null ? (
                 <CircularProgress size={20} />
@@ -436,28 +500,27 @@ export default function App() {
               ) : (
                 <MdError color="#ef4444" size={24} />
               )}
-              <Typography
-                variant="h6"
-                sx={{ fontSize: { xs: "1rem", sm: "1.25rem" } }}
-              >
+              <Typography variant="h6">
                 {isAvailable === null
-                  ? "Checking availability..."
+                  ? "Checking availability…"
                   : isAvailable
                     ? "STT Available"
-                    : "STT Not Available"}
+                    : hasInstalledModel
+                      ? "STT Not Available"
+                      : "Install a Whisper model to enable STT"}
               </Typography>
             </Box>
-
             {availabilityReason && (
-              <Alert severity="info">{availabilityReason}</Alert>
+              <Alert severity={NO_MODEL_HINT.test(availabilityReason) ? "info" : "warning"}>
+                {availabilityReason}
+              </Alert>
             )}
-
             {isAvailable === false && (
               <Button
                 variant="outlined"
                 onClick={checkAvailability}
                 startIcon={<MdRefresh />}
-                sx={{ minHeight: { xs: 48, sm: 44 } }}
+                sx={{ alignSelf: "flex-start" }}
               >
                 Recheck
               </Button>
@@ -465,44 +528,204 @@ export default function App() {
           </Stack>
         </Paper>
 
-        {/* Permission Status */}
+        {/* Whisper model manager  */}
+        <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
+          <Box
+            sx={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              mb: 1.5,
+              flexWrap: "wrap",
+              gap: 1,
+            }}
+          >
+            <Typography variant="h6">Whisper Models</Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Tooltip title="Refresh catalogue">
+                <IconButton size="small" onClick={() => refreshModels()}>
+                  <MdRefresh />
+                </IconButton>
+              </Tooltip>
+              <Button
+                size="small"
+                variant={showAdvanced ? "contained" : "outlined"}
+                onClick={() => setShowAdvanced((v) => !v)}
+              >
+                {showAdvanced ? "Hide advanced" : "Show advanced"}
+              </Button>
+            </Stack>
+          </Box>
+
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
+            Disk usage: {formatBytes(totalDiskBytes)} · System RAM:{" "}
+            {systemMemoryMb > 0 ? `${systemMemoryMb} MB` : "unknown"}
+          </Typography>
+
+          {models.length === 0 ? (
+            <Typography color="text.secondary" sx={{ py: 2 }}>
+              Loading model catalogue…
+            </Typography>
+          ) : (
+            <List disablePadding>
+              {models.map((m, idx) => {
+                const isInstalling =
+                  installingId === m.id ||
+                  (downloadProgress?.modelId === m.id &&
+                    downloadProgress.status === "downloading");
+                return (
+                  <Box key={m.id}>
+                    {idx > 0 && <Divider component="li" />}
+                    <ListItem
+                      sx={{ flexWrap: "wrap", gap: 1, py: 1.5 }}
+                      secondaryAction={
+                        <Stack direction="row" spacing={0.5}>
+                          {m.installed ? (
+                            <>
+                              <Tooltip title={m.active ? "Active model" : "Make active"}>
+                                <span>
+                                  <IconButton
+                                    size="small"
+                                    onClick={() => handleSetActive(m.id)}
+                                    disabled={m.active || isListening}
+                                    color={m.active ? "primary" : "default"}
+                                  >
+                                    {m.active ? <MdStar /> : <MdStarBorder />}
+                                  </IconButton>
+                                </span>
+                              </Tooltip>
+                              <Tooltip title="Remove">
+                                <span>
+                                  <IconButton
+                                    size="small"
+                                    onClick={() => handleRemoveModel(m.id)}
+                                    disabled={isListening}
+                                  >
+                                    <MdDelete />
+                                  </IconButton>
+                                </span>
+                              </Tooltip>
+                            </>
+                          ) : (
+                            <Tooltip
+                              title={
+                                m.fitsInMemory
+                                  ? `Download ${m.sizeMb} MB`
+                                  : `Needs ~${m.requiredMemoryMb} MB RAM`
+                              }
+                            >
+                              <span>
+                                <IconButton
+                                  size="small"
+                                  onClick={() => handleInstallModel(m.id)}
+                                  disabled={!m.fitsInMemory || !!installingId || isListening}
+                                >
+                                  {isInstalling ? (
+                                    <CircularProgress size={18} />
+                                  ) : (
+                                    <MdDownload />
+                                  )}
+                                </IconButton>
+                              </span>
+                            </Tooltip>
+                          )}
+                        </Stack>
+                      }
+                    >
+                      <ListItemText
+                        primary={
+                          <Stack
+                            direction="row"
+                            spacing={1}
+                            alignItems="center"
+                            flexWrap="wrap"
+                          >
+                            <Typography component="span" sx={{ fontWeight: 600 }}>
+                              {m.displayName}
+                            </Typography>
+                            {m.recommended && (
+                              <Chip label="recommended" size="small" color="primary" />
+                            )}
+                            {m.active && <Chip label="active" size="small" color="success" />}
+                            {m.installed && !m.active && (
+                              <Chip label="installed" size="small" />
+                            )}
+                            {m.advanced && (
+                              <Chip label="advanced" size="small" variant="outlined" />
+                            )}
+                          </Stack>
+                        }
+                        secondary={
+                          <Stack direction="row" spacing={1.5} flexWrap="wrap" sx={{ mt: 0.5 }}>
+                            <Typography
+                              component="span"
+                              variant="caption"
+                              color="text.secondary"
+                            >
+                              {m.sizeMb} MB
+                            </Typography>
+                            <Typography
+                              component="span"
+                              variant="caption"
+                              color="text.secondary"
+                            >
+                              ~{m.requiredMemoryMb} MB RAM
+                            </Typography>
+                            <Typography
+                              component="span"
+                              variant="caption"
+                              color="text.secondary"
+                            >
+                              {m.tier}
+                            </Typography>
+                            <Typography
+                              component="span"
+                              variant="caption"
+                              color="text.secondary"
+                            >
+                              {m.language ?? "multilingual"}
+                            </Typography>
+                            {!m.fitsInMemory && !m.installed && (
+                              <Typography component="span" variant="caption" color="error">
+                                Not enough RAM
+                              </Typography>
+                            )}
+                          </Stack>
+                        }
+                      />
+                    </ListItem>
+                  </Box>
+                );
+              })}
+            </List>
+          )}
+        </Paper>
+
+        {/* Permissions  */}
         {permission && (
           <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-            <Typography
-              variant="h6"
-              sx={{
-                mb: { xs: 1.5, sm: 2 },
-                fontSize: { xs: "1rem", sm: "1.25rem" },
-              }}
-            >
+            <Typography variant="h6" sx={{ mb: 1.5 }}>
               Permissions
             </Typography>
             <Stack spacing={1}>
-              <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+              <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
                 <Chip
-                  label={`Microphone: ${permission?.microphone || "Checking..."}`}
-                  color={getPermissionColor(
-                    permission?.microphone || "unknown"
-                  )}
+                  label={`Microphone: ${permission.microphone}`}
+                  color={permColor(permission.microphone)}
                   size="small"
                 />
                 <Chip
-                  label={`Speech Recognition: ${permission?.speechRecognition || "Checking..."}`}
-                  color={getPermissionColor(
-                    permission?.speechRecognition || "unknown"
-                  )}
+                  label={`Speech Recognition: ${permission.speechRecognition}`}
+                  color={permColor(permission.speechRecognition)}
                   size="small"
                 />
               </Box>
-              {permission && permission.microphone !== "granted" && (
+              {permission.microphone !== "granted" && (
                 <Button
                   variant="contained"
                   size="small"
                   onClick={handleRequestPermission}
-                  sx={{
-                    alignSelf: "flex-start",
-                    minHeight: { xs: 48, sm: 44 },
-                  }}
+                  sx={{ alignSelf: "flex-start" }}
                 >
                   Request Permission
                 </Button>
@@ -511,119 +734,69 @@ export default function App() {
           </Paper>
         )}
 
-        {/* Configuration */}
+        {/* Configuration  */}
         <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-          <Typography
-            variant="h6"
-            sx={{
-              mb: { xs: 1.5, sm: 2 },
-              fontSize: { xs: "1rem", sm: "1.25rem" },
-            }}
-          >
+          <Typography variant="h6" sx={{ mb: 1.5 }}>
             Configuration
           </Typography>
-          <Stack spacing={2}>
-            {/* Language Selection */}
-            <Box>
-              <Typography
-                sx={{ mb: 1, fontSize: { xs: "0.875rem", sm: "1rem" } }}
-              >
-                Language (✓ = installed)
-              </Typography>
-              <ToggleButtonGroup
-                value={language}
-                exclusive
-                onChange={(_, value) => value && setLanguage(value)}
-                disabled={isListening || downloadProgress !== null}
-                size="small"
-                sx={{ flexWrap: "wrap" }}
-              >
-                {availableLanguages.map(lang => (
-                  <ToggleButton
-                    key={lang.code}
-                    value={lang.code}
-                    sx={{
-                      color: lang.installed
-                        ? "#22c55e"
-                        : "rgba(255,255,255,0.6)",
-                    }}
-                  >
-                    {lang.code} {lang.installed ? "✓" : "↓"}
-                  </ToggleButton>
-                ))}
-              </ToggleButtonGroup>
-              {!availableLanguages.find(l => l.code === language)
-                ?.installed && (
-                <Typography
-                  sx={{
-                    color: "rgba(255,255,255,0.6)",
-                    fontSize: { xs: "0.625rem", sm: "0.75rem" },
-                    mt: 1,
-                  }}
-                >
-                  Model will be downloaded automatically when you start
-                  listening
-                </Typography>
-              )}
-            </Box>
-
-            {/* Options */}
-            <Stack
-              direction={{ xs: "column", sm: "row" }}
-              spacing={{ xs: 1.5, sm: 2 }}
+          <FormControl
+            size="small"
+            fullWidth
+            disabled={isListening || isProcessing}
+            sx={{ maxWidth: 360 }}
+          >
+            <InputLabel id="stt-language-label">Language</InputLabel>
+            <Select
+              labelId="stt-language-label"
+              label="Language"
+              value={language}
+              onChange={(e) => setLanguage(e.target.value)}
+              MenuProps={{ PaperProps: { sx: { maxHeight: 360 } } }}
             >
-              <FormControlLabel
-                control={
-                  <Switch
-                    checked={interimResults}
-                    onChange={e => setInterimResults(e.target.checked)}
-                    disabled={isListening}
-                  />
-                }
-                label="Interim Results"
-              />
-              <FormControlLabel
-                control={
-                  <Switch
-                    checked={continuous}
-                    onChange={e => setContinuous(e.target.checked)}
-                    disabled={isListening}
-                  />
-                }
-                label="Continuous"
-              />
-            </Stack>
-
-            <TextField
-              label="Max Alternatives"
-              type="number"
-              value={maxAlternatives}
-              onChange={e => setMaxAlternatives(Number(e.target.value))}
-              disabled={isListening}
-              size="small"
-              sx={{ maxWidth: 200 }}
-            />
-          </Stack>
+              <MenuItem value="">
+                <em>Auto-detect</em>
+              </MenuItem>
+              {availableLanguages.map((lang) => (
+                <MenuItem key={lang.code} value={lang.code}>
+                  {lang.name}{" "}
+                  <Typography
+                    component="span"
+                    variant="caption"
+                    color="text.secondary"
+                    sx={{ ml: 1 }}
+                  >
+                    ({lang.code})
+                  </Typography>
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+            {availableLanguages.length > 0 &&
+              `${availableLanguages.length} languages available. `}
+            Whisper has a single <code>pt</code> for all Portuguese variants (Brazilian and
+            European). Its <code>br</code> code is <strong>Breton</strong>, not Brazilian — when
+            in doubt, leave on <em>Auto-detect</em>.
+          </Typography>
         </Paper>
 
-        {/* Controls */}
+        {/* Controls  */}
         <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
           <Stack
             direction={{ xs: "column", sm: "row" }}
-            spacing={{ xs: 1.5, sm: 2 }}
+            spacing={1.5}
             sx={{ justifyContent: "center" }}
           >
             {!isListening ? (
               <Button
                 variant="contained"
                 size="large"
-                onClick={handleStartListening}
-                disabled={loading || isAvailable === false}
-                startIcon={loading ? <CircularProgress size={20} /> : <MdMic />}
+                onClick={handleStart}
+                disabled={busy || !canListen}
+                startIcon={busy ? <CircularProgress size={20} /> : <MdMic />}
                 sx={{
                   bgcolor: "#ef4444",
                   "&:hover": { bgcolor: "#dc2626" },
-                  minHeight: { xs: 48, sm: 44 },
                 }}
               >
                 Start Listening
@@ -632,142 +805,152 @@ export default function App() {
               <Button
                 variant="contained"
                 size="large"
-                onClick={handleStopListening}
-                disabled={loading}
-                startIcon={
-                  loading ? <CircularProgress size={20} /> : <MdStop />
-                }
+                onClick={handleStop}
+                disabled={busy}
+                startIcon={busy ? <CircularProgress size={20} /> : <MdStop />}
                 sx={{
                   bgcolor: "#dc2626",
                   "&:hover": { bgcolor: "#b91c1c" },
-                  minHeight: { xs: 48, sm: 44 },
                 }}
               >
-                Stop
+                Stop & Transcribe
               </Button>
             )}
-
             <Button
               variant="outlined"
-              onClick={handleClearResults}
-              disabled={isListening}
+              onClick={handleClear}
+              disabled={isListening || isProcessing}
               startIcon={<MdRefresh />}
-              sx={{ minHeight: { xs: 48, sm: 44 } }}
             >
               Clear
             </Button>
           </Stack>
+
+          {!canListen && !isListening && !isProcessing && (
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ display: "block", textAlign: "center", mt: 1 }}
+            >
+              {!activeModelId
+                ? "Install and activate a Whisper model above to enable listening."
+                : isAvailable === false
+                  ? "STT plugin not available."
+                  : "Preparing…"}
+            </Typography>
+          )}
         </Paper>
 
-        {/* Transcription Display */}
+        {/* Transcription  */}
         <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-          <Typography
-            variant="h6"
+          <Box
             sx={{
-              mb: { xs: 1.5, sm: 2 },
-              fontSize: { xs: "1rem", sm: "1.25rem" },
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              mb: 1.5,
             }}
           >
-            Transcription
-          </Typography>
-
-          {isListening && (
-            <Box
-              sx={{
-                display: "flex",
-                alignItems: "center",
-                gap: 1,
-                mb: { xs: 1.5, sm: 2 },
-                color: "#ef4444",
-              }}
-            >
-              <Box
-                sx={{
-                  width: 12,
-                  height: 12,
-                  borderRadius: "50%",
-                  bgcolor: "#ef4444",
-                  animation: "pulse 1s infinite",
-                  "@keyframes pulse": {
-                    "0%, 100%": { opacity: 1 },
-                    "50%": { opacity: 0.5 },
-                  },
-                }}
-              />
-              <Typography
-                variant="body2"
-                sx={{ fontSize: { xs: "0.875rem", sm: "1rem" } }}
-              >
-                Listening...
-              </Typography>
-            </Box>
-          )}
+            <Typography variant="h6">Transcription</Typography>
+            {isListening && (
+              <Stack direction="row" spacing={1} alignItems="center" sx={{ color: "#ef4444" }}>
+                <Box
+                  sx={{
+                    width: 12,
+                    height: 12,
+                    borderRadius: "50%",
+                    bgcolor: "#ef4444",
+                    animation: "pulse 1s infinite",
+                    "@keyframes pulse": {
+                      "0%, 100%": { opacity: 1 },
+                      "50%": { opacity: 0.3 },
+                    },
+                  }}
+                />
+                <Typography variant="body2">Recording…</Typography>
+              </Stack>
+            )}
+            {isProcessing && (
+              <Stack direction="row" spacing={1} alignItems="center">
+                <CircularProgress size={16} />
+                <Typography variant="body2">Transcribing…</Typography>
+              </Stack>
+            )}
+          </Box>
 
           <Box
             sx={{
-              minHeight: { xs: 80, sm: 100 },
-              p: { xs: 1.5, sm: 2 },
+              minHeight: 100,
+              p: 2,
               borderRadius: 1,
               bgcolor: "action.hover",
-              fontSize: { xs: "1rem", sm: "1.125rem" },
+              fontSize: "1.05rem",
               lineHeight: 1.6,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
             }}
           >
-            {transcript}
-            {partialTranscript && (
-              <span style={{ opacity: 0.5 }}> {partialTranscript}</span>
-            )}
-            {!transcript && !partialTranscript && (
+            {transcript || (
               <Typography color="text.secondary">
-                Start listening to see transcription here...
+                {isListening
+                  ? "Listening… speak now, then press Stop."
+                  : isProcessing
+                    ? "Whisper is decoding your audio…"
+                    : "Press Start, speak a sentence, then press Stop. The transcript will appear here."}
               </Typography>
             )}
           </Box>
+          {latestAudioUrl && (
+            <Box sx={{ mt: 1.5 }}>
+              <Typography variant="caption" color="text.secondary" sx={{ mb: 0.5, display: "block" }}>
+                Last recording
+              </Typography>
+              <Box
+                component="audio"
+                controls
+                src={latestAudioUrl}
+                sx={{ width: "100%", display: "block" }}
+              />
+            </Box>
+          )}
         </Paper>
 
+        {/* History ---------------------------------------------------- */}
         {results.length > 0 && (
           <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-            <Typography
-              variant="h6"
-              sx={{
-                mb: { xs: 1.5, sm: 2 },
-                fontSize: { xs: "1rem", sm: "1.25rem" },
-              }}
-            >
+            <Typography variant="h6" sx={{ mb: 1.5 }}>
               Results History ({results.length})
             </Typography>
             <List
               sx={{
-                maxHeight: { xs: 200, sm: 300 },
+                maxHeight: 300,
                 overflow: "auto",
                 bgcolor: "action.hover",
                 borderRadius: 1,
               }}
             >
-              {results.map((result, index) => (
-                <ListItem key={index} divider>
+              {results.map((r, idx) => (
+                <ListItem key={idx} divider>
                   <ListItemText
-                    primary={result.text}
+                    primary={r.text}
                     secondary={
-                      <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
-                        <Chip
-                          label={result.isFinal ? "Final" : "Partial"}
-                          size="small"
-                          color={result.isFinal ? "success" : "default"}
-                        />
-                        {result.confidence !== undefined && (
-                          <Chip
-                            label={`${(result.confidence * 100).toFixed(0)}%`}
-                            size="small"
+                      <Stack spacing={1} sx={{ mt: 1 }}>
+                        <Stack direction="row" spacing={1}>
+                          {r.confidence !== undefined && (
+                            <Chip label={`${(r.confidence * 100).toFixed(0)}%`} size="small" />
+                          )}
+                          <Chip label={r.timestamp.toLocaleTimeString()} size="small" />
+                        </Stack>
+                        {r.audioUrl && (
+                          <Box
+                            component="audio"
+                            controls
+                            src={r.audioUrl}
+                            sx={{ width: "100%", display: "block" }}
                           />
                         )}
-                        <Chip
-                          label={result.timestamp.toLocaleTimeString()}
-                          size="small"
-                        />
                       </Stack>
                     }
-                    sx={{}}
                   />
                 </ListItem>
               ))}

@@ -20,10 +20,7 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::de::DeserializeOwned;
 use tauri::{plugin::PluginApi, AppHandle, Emitter, Manager, Runtime};
-use whisper_rs::{
-    convert_integer_to_float_audio, FullParams, SamplingStrategy, WhisperContext,
-    WhisperContextParameters,
-};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::models::*;
 
@@ -636,10 +633,19 @@ impl<R: Runtime> Stt<R> {
                 return;
             }
             let mut buf = buffer.lock().unwrap();
-            // Decimate-while-appending. Skipping inside the producer
-            // avoids an extra alloc + iterator chain on the audio thread.
-            for sample in mono.into_iter().step_by(stride) {
-                buf.push(sample);
+            if stride == 1 {
+                buf.extend_from_slice(&mono);
+            } else {
+                // Box-filter decimation: average every `stride` input
+                // samples into one output sample. This acts as a crude
+                // low-pass filter at ~Nyquist/stride, preventing high-
+                // frequency content from aliasing into the speech band.
+                // Much better than the previous sample-and-hold (step_by)
+                // which introduced audible aliasing at 48 kHz → 16 kHz.
+                for chunk in mono.chunks(stride) {
+                    let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+                    buf.push((sum / chunk.len() as i32) as i16);
+                }
             }
         };
 
@@ -731,20 +737,83 @@ impl<R: Runtime> Stt<R> {
                 }
             };
 
-            // whisper-rs >= 0.14 takes a pre-allocated output slice so
-            // callers can reuse buffers across calls. We allocate fresh
-            // here because each utterance has a different length.
-            let mut audio = vec![0.0_f32; samples.len()];
-            if let Err(e) = convert_integer_to_float_audio(&samples, &mut audio) {
-                let _ = app.emit(
-                    "stt://error",
-                    serde_json::json!({
-                        "code": "Recording",
-                        "message": format!("convert audio: {e}"),
-                    }),
-                );
-                return;
+            // Encode the captured samples into a standard 16 kHz / mono /
+            // 16-bit signed PCM WAV file. Going through a real container
+            // format makes the audio pipeline explicit (sample rate, channel
+            // count, and bit depth are baked into the WAV header) and leaves
+            // a file in the OS temp directory that can be opened in any audio
+            // editor if a transcription misbehaves.
+            let wav_path = {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                std::env::temp_dir().join(format!("stt_recording_{ts}.wav"))
+            };
+            {
+                let spec = hound::WavSpec {
+                    channels: 1,
+                    sample_rate: TARGET_SAMPLE_RATE,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                };
+                let mut writer = match hound::WavWriter::create(&wav_path, spec) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        let _ = app.emit(
+                            "stt://error",
+                            serde_json::json!({
+                                "code": "Recording",
+                                "message": format!("create WAV: {e}"),
+                            }),
+                        );
+                        return;
+                    }
+                };
+                for &s in &samples {
+                    if let Err(e) = writer.write_sample(s) {
+                        let _ = app.emit(
+                            "stt://error",
+                            serde_json::json!({
+                                "code": "Recording",
+                                "message": format!("write WAV sample: {e}"),
+                            }),
+                        );
+                        return;
+                    }
+                }
+                if let Err(e) = writer.finalize() {
+                    let _ = app.emit(
+                        "stt://error",
+                        serde_json::json!({
+                            "code": "Recording",
+                            "message": format!("finalize WAV: {e}"),
+                        }),
+                    );
+                    return;
+                }
             }
+            // Read the WAV back as f32 samples in [-1, 1] — the range
+            // whisper-rs expects. The WAV roundtrip also validates the
+            // entire chain (sample rate, channels, bit depth) in one shot.
+            let mut audio: Vec<f32> = match hound::WavReader::open(&wav_path) {
+                Ok(mut reader) => reader
+                    .samples::<i16>()
+                    .filter_map(|s| s.ok())
+                    .map(|s| s as f32 / i16::MAX as f32)
+                    .collect(),
+                Err(e) => {
+                    let _ = app.emit(
+                        "stt://error",
+                        serde_json::json!({
+                            "code": "Recording",
+                            "message": format!("read WAV: {e}"),
+                        }),
+                    );
+                    let _ = fs::remove_file(&wav_path);
+                    return;
+                }
+            };
             // Whisper rejects clips shorter than ~100 ms with garbage
             // or silence — bail early instead of triggering a panic
             // inside whisper.cpp.
@@ -758,6 +827,15 @@ impl<R: Runtime> Stt<R> {
                 );
                 return;
             }
+            // Pad to at least 1 second of audio. whisper.cpp's decoder
+            // bails on very short clips with `single timestamp ending
+            // - skip entire chunk`, returning zero segments. A trailing
+            // silence pad gives the decoder room to emit a real
+            // end-of-text token instead of an unpaired timestamp.
+            let min_len = TARGET_SAMPLE_RATE as usize;
+            if audio.len() < min_len {
+                audio.resize(min_len, 0.0);
+            }
 
             let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
             params.set_print_special(false);
@@ -765,15 +843,31 @@ impl<R: Runtime> Stt<R> {
             params.set_print_realtime(false);
             params.set_print_timestamps(false);
             params.set_translate(false);
-            // Whisper expects a 2-letter ISO code (`en`, `pt`, …). Pass
-            // `None`/auto-detect when we have no hint.
+            // Whisper expects a 2-letter ISO code (`en`, `pt`, …). When
+            // the caller passes nothing we explicitly request auto-
+            // detection — otherwise whisper-rs silently defaults to
+            // `en` and happily transcribes Portuguese audio as English.
             let lang_short = language
                 .as_deref()
                 .and_then(|tag| tag.split(['-', '_']).next())
-                .map(|s| s.to_string());
-            if let Some(ref l) = lang_short {
-                params.set_language(Some(l.as_str()));
-            }
+                .map(str::to_lowercase);
+            let lang_param: Option<&str> = match lang_short.as_deref() {
+                None | Some("") | Some("auto") => Some("auto"),
+                Some(other) => Some(other),
+            };
+            params.set_language(lang_param);
+            // Force a single segment so whisper always emits text, even
+            // when its internal heuristics would otherwise "skip entire
+            // chunk" on short utterances. Combined with no-timestamps,
+            // this is the standard whisper.cpp setup for live STT.
+            params.set_single_segment(true);
+            params.set_no_timestamps(true);
+            // Don't carry tokens from the previous call — each utterance
+            // is independent and prior context just biases the decoder.
+            params.set_no_context(true);
+            // Suppress the "blank" token so the decoder never returns
+            // an empty result for low-energy frames.
+            params.set_suppress_blank(true);
             // Single-threaded by default would leave most of the CPU
             // unused on multi-core machines. Use up to 4 threads —
             // beyond that whisper.cpp sees diminishing returns and we
@@ -812,10 +906,21 @@ impl<R: Runtime> Stt<R> {
             }
             let transcript = transcript.trim().to_string();
 
+            // Encode the WAV file as base64 so the frontend can play it back
+            // without needing asset-protocol file access. Reading is fast
+            // (the file is already in the OS page cache from the hound write).
+            let audio_data = fs::read(&wav_path).ok().map(|bytes| {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            });
+            // Remove the temp file — the base64 copy is now in the event.
+            let _ = fs::remove_file(&wav_path);
+
             let result = RecognitionResult {
                 transcript,
                 is_final: true,
                 confidence: None,
+                audio_data,
             };
             let _ = app.emit("stt://result", &result);
             let _ = app.emit("plugin:stt:result", &result);

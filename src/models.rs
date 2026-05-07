@@ -38,19 +38,15 @@ pub struct ListenConfig {
 /// Recognition state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum RecognitionState {
     /// Not currently listening
+    #[default]
     Idle,
     /// Actively listening for speech
     Listening,
     /// Processing audio (may briefly occur between utterances)
     Processing,
-}
-
-impl Default for RecognitionState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 /// A speech recognition result
@@ -66,6 +62,11 @@ pub struct RecognitionResult {
     /// Confidence score (0.0 to 1.0), if available
     #[serde(default)]
     pub confidence: Option<f32>,
+
+    /// Base64-encoded WAV audio of the utterance that produced this
+    /// result (desktop only). `None` on mobile / when unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_data: Option<String>,
 }
 
 /// Current status of speech recognition
@@ -345,6 +346,7 @@ mod tests {
             transcript: "Hello world".to_string(),
             is_final: true,
             confidence: Some(0.95),
+            audio_data: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"transcript\":\"Hello world\""));
