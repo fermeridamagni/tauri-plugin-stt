@@ -1,26 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  Alert,
-  Box,
-  Button,
-  Chip,
-  CircularProgress,
-  Container,
-  Divider,
-  FormControl,
-  IconButton,
-  InputLabel,
-  List,
-  ListItem,
-  ListItemText,
-  MenuItem,
-  Paper,
-  Select,
-  Stack,
-  Tooltip,
-  Typography,
-} from "@mui/material";
-import {
   checkPermission as sttCheckPermission,
   getSupportedLanguages,
   installModel,
@@ -40,17 +19,7 @@ import {
   type SupportedLanguage,
   type WhisperModelInfo,
 } from "tauri-plugin-stt-api";
-import {
-  MdCheckCircle,
-  MdDelete,
-  MdDownload,
-  MdError,
-  MdMic,
-  MdRefresh,
-  MdStar,
-  MdStarBorder,
-  MdStop,
-} from "react-icons/md";
+import "./App.css";
 
 const NO_MODEL_HINT = /no whisper model/i;
 
@@ -69,19 +38,11 @@ const formatBytes = (bytes: number) => {
   return mb < 1024 ? `${mb.toFixed(1)} MB` : `${(mb / 1024).toFixed(2)} GB`;
 };
 
-const permColor = (status: string) =>
-  status === "granted" ? "success" : status === "denied" ? "error" : "warning";
-
 export default function App() {
-  // Recognition state
-  // Empty string = "auto-detect" (no language sent → Whisper detects from
-  // audio). Guessing from `navigator.language` was misleading on browsers
-  // that report locales Whisper doesn't actually transcribe well.
   const [language, setLanguage] = useState<string>("");
   const [recognitionState, setRecognitionState] = useState<RecognitionState>("idle");
   const [transcript, setTranscript] = useState<string>("");
   const [results, setResults] = useState<ResultRow[]>([]);
-  /** Object URL of the most recent recording for the top-level player. */
   const [latestAudioUrl, setLatestAudioUrl] = useState<string | null>(null);
 
   const [isAvailable, setIsAvailable] = useState<boolean | null>(null);
@@ -99,32 +60,27 @@ export default function App() {
 
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false); // start/stop button spinner
+  const [busy, setBusy] = useState(false);
 
   const resultsEndRef = useRef<HTMLDivElement>(null);
-  /** Holds all Blob object URLs so we can revoke them on clear/unmount. */
   const audioUrlsRef = useRef<string[]>([]);
 
-  // Revoke all Blob URLs created so far.
   const revokeAllAudioUrls = useCallback(() => {
     for (const url of audioUrlsRef.current) URL.revokeObjectURL(url);
     audioUrlsRef.current = [];
   }, []);
 
-  // Revoke on unmount.
   useEffect(() => revokeAllAudioUrls, [revokeAllAudioUrls]);
 
   useEffect(() => {
     resultsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [results]);
+
   const checkAvailability = useCallback(async () => {
     try {
       const result = await sttIsAvailable();
       setIsAvailable(result.available);
       setAvailabilityReason(result.reason ?? null);
-      // The "no model installed" reason is expected on first run; the
-      // model manager card already speaks to it, so don't surface a red
-      // error toast for it.
       if (!result.available && result.reason && !NO_MODEL_HINT.test(result.reason)) {
         setError(result.reason);
       }
@@ -168,10 +124,7 @@ export default function App() {
   const checkPerm = useCallback(async () => {
     try {
       const perm = await sttCheckPermission();
-      setPermission({
-        microphone: perm.microphone,
-        speechRecognition: perm.speechRecognition,
-      });
+      setPermission({ microphone: perm.microphone, speechRecognition: perm.speechRecognition });
     } catch (err) {
       if (!String(err).includes("Plugin not found")) {
         setError(`Failed to check permission: ${err}`);
@@ -181,7 +134,6 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    const pending: Array<Promise<unknown>> = [];
     const unlistens: Array<() => void> = [];
 
     const callUnlisten = (l: unknown) => {
@@ -196,12 +148,10 @@ export default function App() {
     };
 
     const track = <T,>(p: Promise<T>) => {
-      pending.push(
-        p.then((fn) => {
-          if (cancelled) callUnlisten(fn);
-          else unlistens.push(() => callUnlisten(fn));
-        }),
-      );
+      p.then((fn) => {
+        if (cancelled) callUnlisten(fn);
+        else unlistens.push(() => callUnlisten(fn));
+      });
     };
 
     track(
@@ -215,20 +165,15 @@ export default function App() {
           return;
         }
         setTranscript((prev) => (prev ? `${prev} ${text}` : text));
-        // Convert base64 WAV → Blob URL for in-app playback (desktop only).
         let audioUrl: string | undefined;
         if (result.audioData) {
           try {
-            const bytes = Uint8Array.from(atob(result.audioData), (c) =>
-              c.charCodeAt(0),
-            );
-            audioUrl = URL.createObjectURL(
-              new Blob([bytes], { type: "audio/wav" }),
-            );
+            const bytes = Uint8Array.from(atob(result.audioData), (c) => c.charCodeAt(0));
+            audioUrl = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
             audioUrlsRef.current.push(audioUrl);
             setLatestAudioUrl(audioUrl);
           } catch {
-            // Non-fatal: just won't show a player for this result.
+            // Non-fatal: playback unavailable for this result.
           }
         }
         setResults((prev) => [
@@ -273,20 +218,14 @@ export default function App() {
     return () => {
       cancelled = true;
       for (const u of unlistens) u();
-      // Anything still in-flight will be cleaned up when its promise
-      // resolves (see the `cancelled` check inside `track`).
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // First availability probe.
   useEffect(() => {
     checkAvailability();
   }, [checkAvailability]);
 
-  // After availability resolves, always load the model catalogue (the
-  // user may need to install one) and load languages/permissions when
-  // the plugin is actually usable.
   useEffect(() => {
     if (isAvailable === null) return;
     refreshModels();
@@ -295,13 +234,11 @@ export default function App() {
       checkPerm();
     }
   }, [isAvailable, refreshModels, loadLanguages, checkPerm]);
+
   const handleRequestPermission = async () => {
     try {
       const perm = await sttRequestPermission();
-      setPermission({
-        microphone: perm.microphone,
-        speechRecognition: perm.speechRecognition,
-      });
+      setPermission({ microphone: perm.microphone, speechRecognition: perm.speechRecognition });
       if (perm.microphone === "granted") {
         setInfo("Permission granted!");
         setTimeout(() => setInfo(null), 2000);
@@ -314,12 +251,7 @@ export default function App() {
   const handleInstallModel = async (id: string) => {
     setError(null);
     setInstallingId(id);
-    setDownloadProgress({
-      status: "downloading",
-      modelId: id,
-      model: id,
-      progress: 0,
-    });
+    setDownloadProgress({ status: "downloading", modelId: id, model: id, progress: 0 });
     try {
       await installModel(id);
     } catch (err) {
@@ -361,11 +293,7 @@ export default function App() {
     setError(null);
     setBusy(true);
     try {
-      await startListening({
-        // `undefined` → backend uses Whisper's auto-detect (LANG_AUTO).
-        language: language || undefined,
-      });
-      // recognitionState will flip to "listening" via the state listener.
+      await startListening({ language: language || undefined });
       setInfo("Listening… speak, then press Stop.");
       setTimeout(() => setInfo(null), 2500);
     } catch (err) {
@@ -408,557 +336,381 @@ export default function App() {
   const canListen = isAvailable === true && !!activeModelId && !installingId && !isProcessing;
 
   return (
-    <Container maxWidth="md" sx={{ py: { xs: 2, sm: 3, md: 4 } }}>
-      {/* Header ---------------------------------------------------------- */}
-      <Paper
-        elevation={0}
-        sx={{
-          p: { xs: 2, sm: 3 },
-          mb: { xs: 2, sm: 3 },
-          borderRadius: 2,
-          background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
-          color: "white",
-        }}
-      >
-        <Typography
-          variant="h4"
-          component="h1"
-          sx={{
-            fontSize: { xs: "1.5rem", sm: "2rem", md: "2.125rem" },
-            fontWeight: 700,
-            mb: 1,
-          }}
-        >
-          🎤 Speech-to-Text Example (Whisper)
-        </Typography>
-        <Typography variant="body2" sx={{ opacity: 0.9 }}>
-          Whisper is <strong>record-then-transcribe</strong>: press Start, speak your sentence,
-          then press Stop. The model runs locally and emits the final transcript a moment later.
-        </Typography>
-      </Paper>
+    <div className="page">
+      <header className="header">
+        <div className="header-inner">
+          <h1 className="header-title">Speech-to-Text</h1>
+          <p className="header-subtitle">
+            Tauri Plugin STT — Whisper runs locally, record then transcribe
+          </p>
+        </div>
+      </header>
 
-      {error && (
-        <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError(null)}>
-          {error}
-        </Alert>
-      )}
-      {info && (
-        <Alert severity="info" sx={{ mb: 2 }} onClose={() => setInfo(null)}>
-          {info}
-        </Alert>
-      )}
-
-      <Stack spacing={{ xs: 2, sm: 3 }}>
-        {/* Download progress ------------------------------------------- */}
-        {downloadProgress && (
-          <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-            <Box sx={{ display: "flex", alignItems: "center", gap: 2 }}>
-              <CircularProgress
-                size={24}
-                variant={(downloadProgress.progress ?? 0) > 0 ? "determinate" : "indeterminate"}
-                value={downloadProgress.progress ?? 0}
-              />
-              <Box sx={{ flex: 1 }}>
-                <Typography>
-                  {downloadProgress.status === "downloading"
-                    ? `Downloading ${downloadProgress.modelId ?? downloadProgress.model}… ${downloadProgress.progress ?? 0}%`
-                    : downloadProgress.status === "complete"
-                      ? `${downloadProgress.modelId ?? downloadProgress.model} ready!`
-                      : `Error downloading ${downloadProgress.model}`}
-                </Typography>
-                <Box
-                  sx={{
-                    mt: 1,
-                    height: 4,
-                    bgcolor: "rgba(0,0,0,0.1)",
-                    borderRadius: 2,
-                  }}
-                >
-                  <Box
-                    sx={{
-                      width: `${downloadProgress.progress ?? 0}%`,
-                      height: "100%",
-                      bgcolor: downloadProgress.status === "error" ? "#ef4444" : "#22c55e",
-                      borderRadius: 2,
-                      transition: "width 0.3s",
-                    }}
-                  />
-                </Box>
-              </Box>
-            </Box>
-          </Paper>
+      <main className="main">
+        {error && (
+          <div className="alert alert-error">
+            <span>{error}</span>
+            <button className="alert-close" onClick={() => setError(null)}>
+              ×
+            </button>
+          </div>
+        )}
+        {info && (
+          <div className="alert alert-info">
+            <span>{info}</span>
+            <button className="alert-close" onClick={() => setInfo(null)}>
+              ×
+            </button>
+          </div>
         )}
 
-        {/* Availability  */}
-        <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-          <Stack spacing={1.5}>
-            <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-              {isAvailable === null ? (
-                <CircularProgress size={20} />
-              ) : isAvailable ? (
-                <MdCheckCircle color="#22c55e" size={24} />
-              ) : (
-                <MdError color="#ef4444" size={24} />
+        {/* Download progress */}
+        {downloadProgress && (
+          <div className="card">
+            <div className="progress-header">
+              {downloadProgress.status === "downloading" && (
+                <span className="spinner" aria-label="downloading" />
               )}
-              <Typography variant="h6">
-                {isAvailable === null
-                  ? "Checking availability…"
-                  : isAvailable
-                    ? "STT Available"
-                    : hasInstalledModel
-                      ? "STT Not Available"
-                      : "Install a Whisper model to enable STT"}
-              </Typography>
-            </Box>
-            {availabilityReason && (
-              <Alert severity={NO_MODEL_HINT.test(availabilityReason) ? "info" : "warning"}>
-                {availabilityReason}
-              </Alert>
-            )}
-            {isAvailable === false && (
-              <Button
-                variant="outlined"
-                onClick={checkAvailability}
-                startIcon={<MdRefresh />}
-                sx={{ alignSelf: "flex-start" }}
-              >
-                Recheck
-              </Button>
-            )}
-          </Stack>
-        </Paper>
+              <span>
+                {downloadProgress.status === "downloading"
+                  ? `Downloading ${downloadProgress.modelId ?? downloadProgress.model}… ${downloadProgress.progress ?? 0}%`
+                  : downloadProgress.status === "complete"
+                    ? `${downloadProgress.modelId ?? downloadProgress.model} ready!`
+                    : `Error downloading ${downloadProgress.model}`}
+              </span>
+            </div>
+            <div className="progress-bar">
+              <div
+                className={`progress-fill${downloadProgress.status === "error" ? " progress-fill--error" : ""}`}
+                style={{ width: `${downloadProgress.progress ?? 0}%` }}
+              />
+            </div>
+          </div>
+        )}
 
-        {/* Whisper model manager  */}
-        <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-          <Box
-            sx={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              mb: 1.5,
-              flexWrap: "wrap",
-              gap: 1,
-            }}
-          >
-            <Typography variant="h6">Whisper Models</Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
-              <Tooltip title="Refresh catalogue">
-                <IconButton size="small" onClick={() => refreshModels()}>
-                  <MdRefresh />
-                </IconButton>
-              </Tooltip>
-              <Button
-                size="small"
-                variant={showAdvanced ? "contained" : "outlined"}
+        {/* Availability */}
+        <div className="card">
+          <div className="status-row">
+            <span
+              className={`status-dot ${
+                isAvailable === null
+                  ? "status-dot--pending"
+                  : isAvailable
+                    ? "status-dot--ok"
+                    : "status-dot--error"
+              }`}
+            />
+            <span className="card-title">
+              {isAvailable === null
+                ? "Checking availability…"
+                : isAvailable
+                  ? "STT Available"
+                  : hasInstalledModel
+                    ? "STT Not Available"
+                    : "Install a Whisper model to enable STT"}
+            </span>
+          </div>
+          {availabilityReason && (
+            <p
+              className={`avail-reason ${
+                NO_MODEL_HINT.test(availabilityReason) ? "avail-reason--info" : "avail-reason--warn"
+              }`}
+            >
+              {availabilityReason}
+            </p>
+          )}
+          {isAvailable === false && (
+            <button className="btn btn-secondary btn-sm" onClick={checkAvailability}>
+              ↻ Recheck
+            </button>
+          )}
+        </div>
+
+        {/* Whisper Models */}
+        <div className="card">
+          <div className="card-row">
+            <h2 className="card-title">Whisper Models</h2>
+            <div className="card-row-actions">
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => refreshModels()}
+                title="Refresh catalogue"
+              >
+                ↻
+              </button>
+              <button
+                className={`btn btn-sm ${showAdvanced ? "btn-primary" : "btn-secondary"}`}
                 onClick={() => setShowAdvanced((v) => !v)}
               >
                 {showAdvanced ? "Hide advanced" : "Show advanced"}
-              </Button>
-            </Stack>
-          </Box>
+              </button>
+            </div>
+          </div>
 
-          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
-            Disk usage: {formatBytes(totalDiskBytes)} · System RAM:{" "}
-            {systemMemoryMb > 0 ? `${systemMemoryMb} MB` : "unknown"}
-          </Typography>
+          <p className="meta-line">
+            Disk: {formatBytes(totalDiskBytes)}
+            {systemMemoryMb > 0 && ` · RAM: ${systemMemoryMb} MB`}
+          </p>
 
           {models.length === 0 ? (
-            <Typography color="text.secondary" sx={{ py: 2 }}>
-              Loading model catalogue…
-            </Typography>
+            <p className="empty">Loading model catalogue…</p>
           ) : (
-            <List disablePadding>
-              {models.map((m, idx) => {
+            <div className="model-list">
+              {models.map((m) => {
                 const isInstalling =
                   installingId === m.id ||
                   (downloadProgress?.modelId === m.id &&
                     downloadProgress.status === "downloading");
                 return (
-                  <Box key={m.id}>
-                    {idx > 0 && <Divider component="li" />}
-                    <ListItem
-                      sx={{ flexWrap: "wrap", gap: 1, py: 1.5 }}
-                      secondaryAction={
-                        <Stack direction="row" spacing={0.5}>
-                          {m.installed ? (
-                            <>
-                              <Tooltip title={m.active ? "Active model" : "Make active"}>
-                                <span>
-                                  <IconButton
-                                    size="small"
-                                    onClick={() => handleSetActive(m.id)}
-                                    disabled={m.active || isListening}
-                                    color={m.active ? "primary" : "default"}
-                                  >
-                                    {m.active ? <MdStar /> : <MdStarBorder />}
-                                  </IconButton>
-                                </span>
-                              </Tooltip>
-                              <Tooltip title="Remove">
-                                <span>
-                                  <IconButton
-                                    size="small"
-                                    onClick={() => handleRemoveModel(m.id)}
-                                    disabled={isListening}
-                                  >
-                                    <MdDelete />
-                                  </IconButton>
-                                </span>
-                              </Tooltip>
-                            </>
-                          ) : (
-                            <Tooltip
-                              title={
-                                m.fitsInMemory
-                                  ? `Download ${m.sizeMb} MB`
-                                  : `Needs ~${m.requiredMemoryMb} MB RAM`
-                              }
-                            >
-                              <span>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => handleInstallModel(m.id)}
-                                  disabled={!m.fitsInMemory || !!installingId || isListening}
-                                >
-                                  {isInstalling ? (
-                                    <CircularProgress size={18} />
-                                  ) : (
-                                    <MdDownload />
-                                  )}
-                                </IconButton>
-                              </span>
-                            </Tooltip>
-                          )}
-                        </Stack>
-                      }
-                    >
-                      <ListItemText
-                        primary={
-                          <Stack
-                            direction="row"
-                            spacing={1}
-                            alignItems="center"
-                            flexWrap="wrap"
+                  <div key={m.id} className="model-item">
+                    <div className="model-info">
+                      <div className="model-name-row">
+                        <span className="model-name">{m.displayName}</span>
+                        {m.recommended && <span className="badge">recommended</span>}
+                        {m.active && <span className="badge badge--green">active</span>}
+                        {m.installed && !m.active && (
+                          <span className="badge badge--gray">installed</span>
+                        )}
+                        {m.advanced && <span className="badge badge--outline">advanced</span>}
+                      </div>
+                      <div className="model-meta">
+                        <span>{m.sizeMb} MB</span>
+                        <span>~{m.requiredMemoryMb} MB RAM</span>
+                        <span>{m.tier}</span>
+                        <span>{m.language ?? "multilingual"}</span>
+                        {!m.fitsInMemory && !m.installed && (
+                          <span className="meta-warn">Not enough RAM</span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="model-actions">
+                      {m.installed ? (
+                        <>
+                          <button
+                            className={`btn-icon${m.active ? " btn-icon--active" : ""}`}
+                            onClick={() => handleSetActive(m.id)}
+                            disabled={m.active || isListening}
+                            title={m.active ? "Active model" : "Make active"}
                           >
-                            <Typography component="span" sx={{ fontWeight: 600 }}>
-                              {m.displayName}
-                            </Typography>
-                            {m.recommended && (
-                              <Chip label="recommended" size="small" color="primary" />
-                            )}
-                            {m.active && <Chip label="active" size="small" color="success" />}
-                            {m.installed && !m.active && (
-                              <Chip label="installed" size="small" />
-                            )}
-                            {m.advanced && (
-                              <Chip label="advanced" size="small" variant="outlined" />
-                            )}
-                          </Stack>
-                        }
-                        secondary={
-                          <Stack direction="row" spacing={1.5} flexWrap="wrap" sx={{ mt: 0.5 }}>
-                            <Typography
-                              component="span"
-                              variant="caption"
-                              color="text.secondary"
-                            >
-                              {m.sizeMb} MB
-                            </Typography>
-                            <Typography
-                              component="span"
-                              variant="caption"
-                              color="text.secondary"
-                            >
-                              ~{m.requiredMemoryMb} MB RAM
-                            </Typography>
-                            <Typography
-                              component="span"
-                              variant="caption"
-                              color="text.secondary"
-                            >
-                              {m.tier}
-                            </Typography>
-                            <Typography
-                              component="span"
-                              variant="caption"
-                              color="text.secondary"
-                            >
-                              {m.language ?? "multilingual"}
-                            </Typography>
-                            {!m.fitsInMemory && !m.installed && (
-                              <Typography component="span" variant="caption" color="error">
-                                Not enough RAM
-                              </Typography>
-                            )}
-                          </Stack>
-                        }
-                      />
-                    </ListItem>
-                  </Box>
+                            {m.active ? "★" : "☆"}
+                          </button>
+                          <button
+                            className="btn-icon"
+                            onClick={() => handleRemoveModel(m.id)}
+                            disabled={isListening}
+                            title="Remove"
+                          >
+                            ✕
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          className="btn-icon"
+                          onClick={() => handleInstallModel(m.id)}
+                          disabled={!m.fitsInMemory || !!installingId || isListening}
+                          title={
+                            m.fitsInMemory
+                              ? `Download ${m.sizeMb} MB`
+                              : `Needs ~${m.requiredMemoryMb} MB RAM`
+                          }
+                        >
+                          {isInstalling ? <span className="spinner spinner--sm" /> : "↓"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 );
               })}
-            </List>
+            </div>
           )}
-        </Paper>
+        </div>
 
-        {/* Permissions  */}
+        {/* Permissions */}
         {permission && (
-          <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-            <Typography variant="h6" sx={{ mb: 1.5 }}>
-              Permissions
-            </Typography>
-            <Stack spacing={1}>
-              <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
-                <Chip
-                  label={`Microphone: ${permission.microphone}`}
-                  color={permColor(permission.microphone)}
-                  size="small"
-                />
-                <Chip
-                  label={`Speech Recognition: ${permission.speechRecognition}`}
-                  color={permColor(permission.speechRecognition)}
-                  size="small"
-                />
-              </Box>
-              {permission.microphone !== "granted" && (
-                <Button
-                  variant="contained"
-                  size="small"
-                  onClick={handleRequestPermission}
-                  sx={{ alignSelf: "flex-start" }}
-                >
-                  Request Permission
-                </Button>
-              )}
-            </Stack>
-          </Paper>
+          <div className="card">
+            <h2 className="card-title">Permissions</h2>
+            <div className="perm-badges">
+              <span
+                className={`perm-badge perm-badge--${permission.microphone === "granted" ? "granted" : permission.microphone === "denied" ? "denied" : "prompt"}`}
+              >
+                Microphone: {permission.microphone}
+              </span>
+              <span
+                className={`perm-badge perm-badge--${permission.speechRecognition === "granted" ? "granted" : permission.speechRecognition === "denied" ? "denied" : "prompt"}`}
+              >
+                Speech Recognition: {permission.speechRecognition}
+              </span>
+            </div>
+            {permission.microphone !== "granted" && (
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={handleRequestPermission}
+                style={{ alignSelf: "flex-start" }}
+              >
+                Request Permission
+              </button>
+            )}
+          </div>
         )}
 
-        {/* Configuration  */}
-        <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-          <Typography variant="h6" sx={{ mb: 1.5 }}>
-            Configuration
-          </Typography>
-          <FormControl
-            size="small"
-            fullWidth
-            disabled={isListening || isProcessing}
-            sx={{ maxWidth: 360 }}
-          >
-            <InputLabel id="stt-language-label">Language</InputLabel>
-            <Select
-              labelId="stt-language-label"
-              label="Language"
-              value={language}
-              onChange={(e) => setLanguage(e.target.value)}
-              MenuProps={{ PaperProps: { sx: { maxHeight: 360 } } }}
-            >
-              <MenuItem value="">
-                <em>Auto-detect</em>
-              </MenuItem>
-              {availableLanguages.map((lang) => (
-                <MenuItem key={lang.code} value={lang.code}>
-                  {lang.name}{" "}
-                  <Typography
-                    component="span"
-                    variant="caption"
-                    color="text.secondary"
-                    sx={{ ml: 1 }}
-                  >
-                    ({lang.code})
-                  </Typography>
-                </MenuItem>
-              ))}
-            </Select>
-          </FormControl>
-          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
-            {availableLanguages.length > 0 &&
-              `${availableLanguages.length} languages available. `}
-            Whisper has a single <code>pt</code> for all Portuguese variants (Brazilian and
-            European). Its <code>br</code> code is <strong>Breton</strong>, not Brazilian — when
-            in doubt, leave on <em>Auto-detect</em>.
-          </Typography>
-        </Paper>
+        {/* Configuration */}
+        <div className="card">
+          <h2 className="card-title">Configuration</h2>
+          <div className="field">
+            <label className="field-label" htmlFor="stt-language">
+              Language
+            </label>
+            <div className="select-wrap">
+              <select
+                id="stt-language"
+                className="select"
+                value={language}
+                onChange={(e) => setLanguage(e.target.value)}
+                disabled={isListening || isProcessing}
+              >
+                <option value="">Auto-detect</option>
+                {availableLanguages.map((lang) => (
+                  <option key={lang.code} value={lang.code}>
+                    {lang.name} ({lang.code})
+                  </option>
+                ))}
+              </select>
+              <svg
+                className="select-chevron"
+                width="12"
+                height="12"
+                viewBox="0 0 12 12"
+                aria-hidden
+              >
+                <path
+                  d="M2 4l4 4 4-4"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  fill="none"
+                />
+              </svg>
+            </div>
+            <p className="field-hint">
+              {availableLanguages.length > 0 &&
+                `${availableLanguages.length} languages available. `}
+              Whisper uses <code>pt</code> for all Portuguese variants. Its <code>br</code> code is
+              Breton, not Brazilian — when in doubt, leave on Auto-detect.
+            </p>
+          </div>
+        </div>
 
-        {/* Controls  */}
-        <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-          <Stack
-            direction={{ xs: "column", sm: "row" }}
-            spacing={1.5}
-            sx={{ justifyContent: "center" }}
-          >
+        {/* Controls */}
+        <div className="card">
+          <div className="actions">
             {!isListening ? (
-              <Button
-                variant="contained"
-                size="large"
+              <button
+                className="btn btn-record"
                 onClick={handleStart}
                 disabled={busy || !canListen}
-                startIcon={busy ? <CircularProgress size={20} /> : <MdMic />}
-                sx={{
-                  bgcolor: "#ef4444",
-                  "&:hover": { bgcolor: "#dc2626" },
-                }}
               >
-                Start Listening
-              </Button>
+                {busy ? <span className="spinner spinner--white" /> : "●"} Start Listening
+              </button>
             ) : (
-              <Button
-                variant="contained"
-                size="large"
+              <button
+                className="btn btn-record btn-record--stop"
                 onClick={handleStop}
                 disabled={busy}
-                startIcon={busy ? <CircularProgress size={20} /> : <MdStop />}
-                sx={{
-                  bgcolor: "#dc2626",
-                  "&:hover": { bgcolor: "#b91c1c" },
-                }}
               >
-                Stop & Transcribe
-              </Button>
+                {busy ? <span className="spinner spinner--white" /> : "■"} Stop & Transcribe
+              </button>
             )}
-            <Button
-              variant="outlined"
+            <button
+              className="btn btn-secondary"
               onClick={handleClear}
               disabled={isListening || isProcessing}
-              startIcon={<MdRefresh />}
             >
               Clear
-            </Button>
-          </Stack>
+            </button>
+          </div>
 
           {!canListen && !isListening && !isProcessing && (
-            <Typography
-              variant="caption"
-              color="text.secondary"
-              sx={{ display: "block", textAlign: "center", mt: 1 }}
-            >
+            <p className="controls-hint">
               {!activeModelId
                 ? "Install and activate a Whisper model above to enable listening."
                 : isAvailable === false
                   ? "STT plugin not available."
                   : "Preparing…"}
-            </Typography>
+            </p>
           )}
-        </Paper>
+        </div>
 
-        {/* Transcription  */}
-        <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-          <Box
-            sx={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              mb: 1.5,
-            }}
-          >
-            <Typography variant="h6">Transcription</Typography>
-            {isListening && (
-              <Stack direction="row" spacing={1} alignItems="center" sx={{ color: "#ef4444" }}>
-                <Box
-                  sx={{
-                    width: 12,
-                    height: 12,
-                    borderRadius: "50%",
-                    bgcolor: "#ef4444",
-                    animation: "pulse 1s infinite",
-                    "@keyframes pulse": {
-                      "0%, 100%": { opacity: 1 },
-                      "50%": { opacity: 0.3 },
-                    },
-                  }}
-                />
-                <Typography variant="body2">Recording…</Typography>
-              </Stack>
-            )}
-            {isProcessing && (
-              <Stack direction="row" spacing={1} alignItems="center">
-                <CircularProgress size={16} />
-                <Typography variant="body2">Transcribing…</Typography>
-              </Stack>
-            )}
-          </Box>
+        {/* Transcription */}
+        <div className="card">
+          <div className="card-row">
+            <h2 className="card-title">Transcription</h2>
+            <div className="rec-status">
+              {isListening && (
+                <>
+                  <span className="rec-dot" />
+                  <span className="rec-label">Recording…</span>
+                </>
+              )}
+              {isProcessing && (
+                <>
+                  <span className="spinner spinner--sm" />
+                  <span className="rec-label">Transcribing…</span>
+                </>
+              )}
+            </div>
+          </div>
 
-          <Box
-            sx={{
-              minHeight: 100,
-              p: 2,
-              borderRadius: 1,
-              bgcolor: "action.hover",
-              fontSize: "1.05rem",
-              lineHeight: 1.6,
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-            }}
-          >
+          <div className="transcript-box">
             {transcript || (
-              <Typography color="text.secondary">
+              <span className="transcript-placeholder">
                 {isListening
                   ? "Listening… speak now, then press Stop."
                   : isProcessing
                     ? "Whisper is decoding your audio…"
                     : "Press Start, speak a sentence, then press Stop. The transcript will appear here."}
-              </Typography>
+              </span>
             )}
-          </Box>
-          {latestAudioUrl && (
-            <Box sx={{ mt: 1.5 }}>
-              <Typography variant="caption" color="text.secondary" sx={{ mb: 0.5, display: "block" }}>
-                Last recording
-              </Typography>
-              <Box
-                component="audio"
-                controls
-                src={latestAudioUrl}
-                sx={{ width: "100%", display: "block" }}
-              />
-            </Box>
-          )}
-        </Paper>
+          </div>
 
-        {/* History ---------------------------------------------------- */}
+          {latestAudioUrl && (
+            <div className="audio-player">
+              <p className="field-label">Last recording</p>
+              <audio controls src={latestAudioUrl} style={{ width: "100%", display: "block" }} />
+            </div>
+          )}
+        </div>
+
+        {/* Results history */}
         {results.length > 0 && (
-          <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-            <Typography variant="h6" sx={{ mb: 1.5 }}>
-              Results History ({results.length})
-            </Typography>
-            <List
-              sx={{
-                maxHeight: 300,
-                overflow: "auto",
-                bgcolor: "action.hover",
-                borderRadius: 1,
-              }}
-            >
+          <div className="card">
+            <h2 className="card-title">Results History ({results.length})</h2>
+            <div className="results-list">
               {results.map((r, idx) => (
-                <ListItem key={idx} divider>
-                  <ListItemText
-                    primary={r.text}
-                    secondary={
-                      <Stack spacing={1} sx={{ mt: 1 }}>
-                        <Stack direction="row" spacing={1}>
-                          {r.confidence !== undefined && (
-                            <Chip label={`${(r.confidence * 100).toFixed(0)}%`} size="small" />
-                          )}
-                          <Chip label={r.timestamp.toLocaleTimeString()} size="small" />
-                        </Stack>
-                        {r.audioUrl && (
-                          <Box
-                            component="audio"
-                            controls
-                            src={r.audioUrl}
-                            sx={{ width: "100%", display: "block" }}
-                          />
-                        )}
-                      </Stack>
-                    }
-                  />
-                </ListItem>
+                <div key={idx} className="result-item">
+                  <p className="result-text">{r.text}</p>
+                  <div className="result-meta">
+                    {r.confidence !== undefined && (
+                      <span className="badge badge--gray">
+                        {(r.confidence * 100).toFixed(0)}%
+                      </span>
+                    )}
+                    <span className="badge badge--gray">{r.timestamp.toLocaleTimeString()}</span>
+                  </div>
+                  {r.audioUrl && (
+                    <audio
+                      controls
+                      src={r.audioUrl}
+                      style={{ width: "100%", display: "block", marginTop: 8 }}
+                    />
+                  )}
+                </div>
               ))}
               <div ref={resultsEndRef} />
-            </List>
-          </Paper>
+            </div>
+          </div>
         )}
-      </Stack>
-    </Container>
+      </main>
+    </div>
   );
 }
