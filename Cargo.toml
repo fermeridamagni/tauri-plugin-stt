@@ -1,6 +1,6 @@
 [package]
 name = "tauri-plugin-stt"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Affex Team"]
 description = "Speech-to-text recognition plugin for Tauri with multi-language support"
 edition = "2021"

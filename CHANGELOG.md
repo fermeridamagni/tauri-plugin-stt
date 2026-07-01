@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-06-30
+
+### Added
+
+- `large-v3-turbo` model now fully documented and exposed in the TypeScript (`WhisperModelInfo.id`) and Rust doc comments, and listed in the README Model Catalogue table.
+
+### Fixed
+
+- `large-v3-turbo` catalogue entry corrected: `required_memory_mb` lowered from 6144 to 3584 MB to reflect its actual footprint (was copy-pasted from `large-v3`), which had been incorrectly blocking installs on 8 GB devices. Display name clarified from `"Turbo"` to `"Large v3 Turbo"`.
+- `list_models()` now uses the same 30% memory headroom as `install_model()` when computing `fitsInMemory`.
+- `InsufficientMemory` error now reports the headroom-adjusted memory requirement instead of the raw `required_memory_mb`, matching the "with 30% headroom" wording in the message.
+
 ## [0.1.0] - 2025-12
 
 ### Added
