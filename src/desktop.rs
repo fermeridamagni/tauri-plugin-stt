@@ -59,10 +59,12 @@ const MEMORY_HEADROOM_DENOMINATOR: u32 = 10;
 /// `true` when `host_mb` covers `required_mb` *with* the standard 30 %
 /// headroom we promise the user. Saturating math so a stratospheric
 /// `required_mb` can't wrap around.
+fn memory_needed_mb(required_mb: u32) -> u32 {
+    required_mb.saturating_mul(MEMORY_HEADROOM_NUMERATOR) / MEMORY_HEADROOM_DENOMINATOR
+}
+
 fn host_fits(host_mb: u32, required_mb: u32) -> bool {
-    let needed =
-        required_mb.saturating_mul(MEMORY_HEADROOM_NUMERATOR) / MEMORY_HEADROOM_DENOMINATOR;
-    host_mb >= needed
+    host_mb >= memory_needed_mb(required_mb)
 }
 
 const CATALOGUE: &[ModelSpec] = &[
@@ -348,7 +350,7 @@ impl<R: Runtime> Stt<R> {
                         total = total.saturating_add(meta.len());
                     }
                 }
-                let fits = spec.required_memory_mb <= host_mb;
+                let fits = host_fits(host_mb, spec.required_memory_mb);
                 let visible = installed || include_advanced || (!spec.advanced && fits);
                 if !visible {
                     return None;
@@ -401,7 +403,9 @@ impl<R: Runtime> Stt<R> {
         if host_mb > 0 && !host_fits(host_mb, spec.required_memory_mb) {
             return Err(crate::Error::InsufficientMemory(format!(
                 "{} needs ~{} MB (with 30% headroom) but this device reports {} MB total",
-                spec.display_name, spec.required_memory_mb, host_mb
+                spec.display_name,
+                memory_needed_mb(spec.required_memory_mb),
+                host_mb
             )));
         }
         fs::create_dir_all(self.models_dir())
