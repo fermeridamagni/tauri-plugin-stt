@@ -60,6 +60,7 @@ fn main() {
 | `base`     | 142 MB | balanced ⭐   |
 | `small`    | 466 MB | accurate      |
 | `medium`   | 1.5 GB | very accurate |
+| `large-v3-turbo` | 1.6 GB | fast & accurate (advanced) |
 | `large-v3` | 3.0 GB | most accurate |
 
 Files are fetched from HuggingFace (`ggerganov/whisper.cpp`) and stored under `<app_data_dir>/whisper-models/`. The active model is persisted to `whisper-models/active.txt`.
