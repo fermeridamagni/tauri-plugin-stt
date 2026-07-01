@@ -79,7 +79,7 @@ export interface PermissionResponse {
 
 /** Metadata for a single Whisper model in the catalogue. */
 export interface WhisperModelInfo {
-  /** Stable identifier (`tiny`, `tiny.en`, `base`, `base.en`, `small`, `small.en`, `medium`, `medium.en`, `large-v3`). */
+  /** Stable identifier (`tiny`, `tiny.en`, `base`, `base.en`, `small`, `small.en`, `medium`, `medium.en`, `large-v3-turbo`, `large-v3`). */
   id: string;
   /** Human-readable name shown in the model manager. */
   displayName: string;

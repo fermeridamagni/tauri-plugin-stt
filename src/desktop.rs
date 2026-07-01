@@ -166,16 +166,16 @@ const CATALOGUE: &[ModelSpec] = &[
         language: Some("en"),
         advanced: false,
     },
-    // 809 M params · ~6 GB VRAM · ~8× realtime — multilingual only.
-    // Faster than `medium` and almost as accurate, but the 6 GB working
-    // set rules out most laptops; advanced-only by default.
+    // 809 M params · ~3.5 GB VRAM · ~4× realtime — multilingual only.
+    // Pruned large-v3 decoder (32 → 4 layers); faster than `medium`
+    // and almost as accurate. Advanced-only by default.
     ModelSpec {
         id: "large-v3-turbo",
-        display_name: "Turbo",
+        display_name: "Large v3 Turbo",
         file_name: "ggml-large-v3-turbo.bin",
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
         size_mb: 1620,
-        required_memory_mb: 6144,
+        required_memory_mb: 3584,
         tier: "fast & accurate",
         recommended: false,
         language: None,

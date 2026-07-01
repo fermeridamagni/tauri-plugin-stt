@@ -241,7 +241,8 @@ pub struct SttError {
 #[serde(rename_all = "camelCase")]
 pub struct WhisperModelInfo {
     /// Stable identifier (`tiny`, `tiny.en`, `base`, `base.en`,
-    /// `small`, `small.en`, `medium`, `medium.en`, `large-v3`).
+    /// `small`, `small.en`, `medium`, `medium.en`, `large-v3-turbo`,
+    /// `large-v3`).
     pub id: String,
     /// Human-readable name shown in the model manager.
     pub display_name: String,
