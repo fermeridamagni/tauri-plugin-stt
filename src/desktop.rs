@@ -244,6 +244,8 @@ struct SttState {
     /// this flips to `false`, so we never drop the stream — we just
     /// stop appending samples.
     listening: Arc<AtomicBool>,
+    /// `true` while a background transcription is running in `transcribe_and_emit`.
+    transcribing: bool,
     /// Live cpal stream. Kept alive for the plugin's lifetime so the
     /// first `start_listening` can be reused (cpal stream creation is
     /// expensive and triggers the macOS microphone permission prompt).
@@ -271,6 +273,7 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
             TARGET_SAMPLE_RATE as usize * 30,
         ))),
         listening: Arc::new(AtomicBool::new(false)),
+        transcribing: false,
         stream_alive: false,
         audio_sender: None,
         max_duration_ms: None,
@@ -778,7 +781,15 @@ impl<R: Runtime> Stt<R> {
         let app = self.app.clone();
         let state = self.state.clone();
 
+        {
+            let mut s = state.lock().unwrap();
+            s.transcribing = true;
+        }
+
         thread::spawn(move || {
+            let _guard = TranscribeGuard {
+                state: state.clone(),
+            };
             // Re-fetch the context inside the worker to keep the lock
             // duration short on the main path. If load fails we surface
             // it via the standard error event.
@@ -1153,9 +1164,7 @@ impl<R: Runtime> Stt<R> {
 
     pub fn unload_model(&self) -> crate::Result<()> {
         let mut state = self.state.lock().unwrap();
-        state.context = None;
-        state.loaded_model = None;
-        Ok(())
+        state.unload_model()
     }
 }
 
@@ -1226,6 +1235,36 @@ fn downmix_u16(data: &[u16], channels: usize) -> Vec<i16> {
         .collect()
 }
 
+impl SttState {
+    fn unload_model(&mut self) -> crate::Result<()> {
+        if self.listening.load(Ordering::SeqCst) {
+            return Err(crate::Error::Recording(
+                "cannot unload model while recording is active".into(),
+            ));
+        }
+        if self.transcribing {
+            return Err(crate::Error::Recording(
+                "cannot unload model while transcription is active".into(),
+            ));
+        }
+        self.context = None;
+        self.loaded_model = None;
+        Ok(())
+    }
+}
+
+struct TranscribeGuard {
+    state: Arc<Mutex<SttState>>,
+}
+
+impl Drop for TranscribeGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.transcribing = false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,5 +1301,41 @@ mod tests {
         let res = reply_rx.recv().unwrap();
         assert!(res.is_ok());
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_unload_model_prevention() {
+        let mut state = SttState {
+            context: None,
+            loaded_model: None,
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            listening: Arc::new(AtomicBool::new(false)),
+            transcribing: false,
+            stream_alive: false,
+            audio_sender: None,
+            max_duration_ms: None,
+            started_at: None,
+            language: None,
+        };
+
+        // 1. Success initially (no model loaded, but not active)
+        assert!(state.unload_model().is_ok());
+
+        // 2. Fails when listening is true
+        state.listening.store(true, Ordering::SeqCst);
+        let err1 = state.unload_model().unwrap_err();
+        assert!(matches!(err1, crate::Error::Recording(_)));
+
+        // Reset listening
+        state.listening.store(false, Ordering::SeqCst);
+
+        // 3. Fails when transcribing is true
+        state.transcribing = true;
+        let err2 = state.unload_model().unwrap_err();
+        assert!(matches!(err2, crate::Error::Recording(_)));
+
+        // Reset transcribing
+        state.transcribing = false;
+        assert!(state.unload_model().is_ok());
     }
 }

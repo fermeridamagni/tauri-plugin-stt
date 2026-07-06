@@ -307,30 +307,6 @@
           "markdownDescription": "Denies the check_permission command without any pre-configured scope."
         },
         {
-          "description": "Enables the check_permission command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-check-permission",
-          "markdownDescription": "Enables the check_permission command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the check_permission command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-check-permission",
-          "markdownDescription": "Denies the check_permission command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the get_supported_languages command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-get-supported-languages",
-          "markdownDescription": "Enables the get_supported_languages command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the get_supported_languages command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-get-supported-languages",
-          "markdownDescription": "Denies the get_supported_languages command without any pre-configured scope."
-        },
-        {
           "description": "Enables the get_supported_languages command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-supported-languages",
@@ -353,18 +329,6 @@
           "type": "string",
           "const": "deny-install-model",
           "markdownDescription": "Denies the install_model command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the is_available command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-is-available",
-          "markdownDescription": "Enables the is_available command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the is_available command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-is-available",
-          "markdownDescription": "Denies the is_available command without any pre-configured scope."
         },
         {
           "description": "Enables the is_available command without any pre-configured scope.",
@@ -439,18 +403,6 @@
           "markdownDescription": "Denies the request_permission command without any pre-configured scope."
         },
         {
-          "description": "Enables the request_permission command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-request-permission",
-          "markdownDescription": "Enables the request_permission command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the request_permission command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-request-permission",
-          "markdownDescription": "Denies the request_permission command without any pre-configured scope."
-        },
-        {
           "description": "Enables the set_active_model command without any pre-configured scope.",
           "type": "string",
           "const": "allow-set-active-model",
@@ -473,30 +425,6 @@
           "type": "string",
           "const": "deny-start-listening",
           "markdownDescription": "Denies the start_listening command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the start_listening command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-start-listening",
-          "markdownDescription": "Enables the start_listening command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the start_listening command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-start-listening",
-          "markdownDescription": "Denies the start_listening command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the stop_listening command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-stop-listening",
-          "markdownDescription": "Enables the stop_listening command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the stop_listening command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-stop-listening",
-          "markdownDescription": "Denies the stop_listening command without any pre-configured scope."
         },
         {
           "description": "Enables the stop_listening command without any pre-configured scope.",
