@@ -9,6 +9,7 @@ const COMMANDS: &[&str] = &[
     "install_model",
     "remove_model",
     "set_active_model",
+    "unload_model",
 ];
 
 fn main() {

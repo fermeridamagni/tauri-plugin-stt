@@ -87,4 +87,8 @@ impl<R: Runtime> Stt<R> {
     pub fn set_active_model(&self, _id: String) -> crate::Result<()> {
         Ok(())
     }
+
+    pub fn unload_model(&self) -> crate::Result<()> {
+        Ok(())
+    }
 }

@@ -14,6 +14,7 @@ import {
   setActiveModel,
   startListening,
   stopListening,
+  unloadModel,
   type DownloadProgressEvent,
   type RecognitionState,
   type SupportedLanguage,
@@ -323,6 +324,18 @@ export default function App() {
     }
   };
 
+  const handleUnloadModel = async () => {
+    setError(null);
+    try {
+      await unloadModel();
+      setInfo("Model unloaded from memory");
+      setTimeout(() => setInfo(null), 1500);
+      await refreshModels();
+    } catch (err) {
+      setError(`Failed to unload model: ${err}`);
+    }
+  };
+
   const handleClear = () => {
     setTranscript("");
     setResults([]);
@@ -627,6 +640,13 @@ export default function App() {
               disabled={isListening || isProcessing}
             >
               Clear
+            </button>
+            <button
+              className="btn btn-secondary"
+              onClick={handleUnloadModel}
+              disabled={isListening || isProcessing || !activeModelId}
+            >
+              Unload Model
             </button>
           </div>
 

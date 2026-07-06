@@ -16,6 +16,7 @@ Default permissions for the STT plugin - allows all speech-to-text operations
 - `allow-install-model`
 - `allow-remove-model`
 - `allow-set-active-model`
+- `allow-unload-model`
 
 ## Permission Table
 
@@ -490,6 +491,32 @@ Enables the stop_listening command without any pre-configured scope.
 <td>
 
 Denies the stop_listening command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`stt:allow-unload-model`
+
+</td>
+<td>
+
+Enables the unload_model command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`stt:deny-unload-model`
+
+</td>
+<td>
+
+Denies the unload_model command without any pre-configured scope.
 
 </td>
 </tr>

@@ -55,6 +55,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::install_model,
             commands::remove_model,
             commands::set_active_model,
+            commands::unload_model,
         ]);
     }
 
@@ -71,6 +72,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::install_model,
             commands::remove_model,
             commands::set_active_model,
+            commands::unload_model,
         ]);
     }
 

@@ -101,3 +101,8 @@ pub(crate) async fn remove_model<R: Runtime>(app: AppHandle<R>, id: String) -> R
 pub(crate) async fn set_active_model<R: Runtime>(app: AppHandle<R>, id: String) -> Result<()> {
     app.stt().set_active_model(id)
 }
+
+#[command]
+pub(crate) async fn unload_model<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+    app.stt().unload_model()
+}
