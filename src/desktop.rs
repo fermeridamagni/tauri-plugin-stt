@@ -218,6 +218,15 @@ fn system_memory_mb() -> u32 {
     u32::try_from(mb).unwrap_or(u32::MAX)
 }
 
+enum AudioControl {
+    Start {
+        buffer: Arc<Mutex<Vec<i16>>>,
+        listening: Arc<AtomicBool>,
+        reply: std::sync::mpsc::Sender<std::result::Result<(), String>>,
+    },
+    Stop,
+}
+
 /// Mutable state shared across commands. Wrapped in `Arc<Mutex<…>>`
 /// because the cpal audio thread also pushes samples into the buffer
 /// while the user is speaking.
@@ -235,10 +244,14 @@ struct SttState {
     /// this flips to `false`, so we never drop the stream — we just
     /// stop appending samples.
     listening: Arc<AtomicBool>,
+    /// `true` while a background transcription is running in `transcribe_and_emit`.
+    transcribing: bool,
     /// Live cpal stream. Kept alive for the plugin's lifetime so the
     /// first `start_listening` can be reused (cpal stream creation is
     /// expensive and triggers the macOS microphone permission prompt).
     stream_alive: bool,
+    /// Audio thread control sender.
+    audio_sender: Option<std::sync::mpsc::Sender<AudioControl>>,
     /// Optional max-duration (ms) after which we auto-stop. `None`
     /// means "until the caller invokes `stop_listening`".
     max_duration_ms: Option<u64>,
@@ -260,7 +273,9 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
             TARGET_SAMPLE_RATE as usize * 30,
         ))),
         listening: Arc::new(AtomicBool::new(false)),
+        transcribing: false,
         stream_alive: false,
+        audio_sender: None,
         max_duration_ms: None,
         started_at: None,
         language: None,
@@ -599,120 +614,163 @@ impl<R: Runtime> Stt<R> {
     }
 
     /// Builds (once) the cpal input stream that pushes mono i16 samples
-    /// into `state.buffer` whenever `state.listening` is true. The
-    /// stream is leaked on purpose so it survives across sessions —
-    /// the first call is the slow one (microphone permission, device
-    /// negotiation), every subsequent session reuses it.
+    /// into `state.buffer` whenever `state.listening` is true. We manage
+    /// the stream in a separate background thread via `AudioControl` to
+    /// ensure it is properly dropped and releases the OS microphone hook when stopped.
     fn ensure_audio_stream(&self) -> crate::Result<()> {
-        {
-            let state = self.state.lock().unwrap();
-            if state.stream_alive {
-                return Ok(());
-            }
-        }
-
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| crate::Error::Recording("no input device available".into()))?;
-        let config = device
-            .default_input_config()
-            .map_err(|e| crate::Error::Recording(format!("input config: {e}")))?;
-
-        let channels = config.channels() as usize;
-        // cpal's `sample_rate()` returns the raw `u32` Hz value in this
-        // version — no newtype wrapper to unpack.
-        let device_rate = config.sample_rate() as f64;
-        let sample_format = config.sample_format();
-        // Cheap nearest-neighbour decimation. Whisper is robust enough
-        // that high-quality resampling buys nothing here, especially at
-        // the 16/44.1/48 kHz combinations we hit in practice.
-        let stride = (device_rate / TARGET_SAMPLE_RATE as f64).max(1.0) as usize;
-
-        let buffer = self.state.lock().unwrap().buffer.clone();
-        let listening = self.state.lock().unwrap().listening.clone();
-
-        let push = move |mono: Vec<i16>| {
-            if !listening.load(Ordering::Relaxed) {
-                return;
-            }
-            let mut buf = buffer.lock().unwrap();
-            if stride == 1 {
-                buf.extend_from_slice(&mono);
-            } else {
-                // Box-filter decimation: average every `stride` input
-                // samples into one output sample. This acts as a crude
-                // low-pass filter at ~Nyquist/stride, preventing high-
-                // frequency content from aliasing into the speech band.
-                // Much better than the previous sample-and-hold (step_by)
-                // which introduced audible aliasing at 48 kHz → 16 kHz.
-                for chunk in mono.chunks(stride) {
-                    let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
-                    buf.push((sum / chunk.len() as i32) as i16);
-                }
-            }
-        };
-
-        let stream_config: cpal::StreamConfig = config.clone().into();
-        let err_fn = |err| eprintln!("[tauri-plugin-stt] audio stream error: {err}");
-
-        let stream = match sample_format {
-            cpal::SampleFormat::F32 => {
-                let push = push.clone();
-                device.build_input_stream(
-                    &stream_config,
-                    move |data: &[f32], _| {
-                        let mono = downmix_f32(data, channels);
-                        push(mono);
-                    },
-                    err_fn,
-                    None,
-                )
-            }
-            cpal::SampleFormat::I16 => {
-                let push = push.clone();
-                device.build_input_stream(
-                    &stream_config,
-                    move |data: &[i16], _| {
-                        let mono = downmix_i16(data, channels);
-                        push(mono);
-                    },
-                    err_fn,
-                    None,
-                )
-            }
-            cpal::SampleFormat::U16 => {
-                let push = push.clone();
-                device.build_input_stream(
-                    &stream_config,
-                    move |data: &[u16], _| {
-                        let mono = downmix_u16(data, channels);
-                        push(mono);
-                    },
-                    err_fn,
-                    None,
-                )
-            }
-            other => {
-                return Err(crate::Error::Recording(format!(
-                    "unsupported sample format: {other:?}"
-                )));
-            }
-        }
-        .map_err(|e| crate::Error::Recording(format!("build input stream: {e}")))?;
-
-        stream
-            .play()
-            .map_err(|e| crate::Error::Recording(format!("play stream: {e}")))?;
-
-        // Keep the stream alive without dragging it through the state
-        // struct (cpal streams aren't `Send`). Leaking is the standard
-        // pattern in cpal-based Tauri plugins.
-        std::mem::forget(stream);
-
         let mut state = self.state.lock().unwrap();
-        state.stream_alive = true;
-        Ok(())
+        if state.audio_sender.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<AudioControl>();
+            state.audio_sender = Some(tx);
+            thread::spawn(move || {
+                let mut stream: Option<cpal::Stream> = None;
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        AudioControl::Start {
+                            buffer,
+                            listening,
+                            reply,
+                        } => {
+                            let host = cpal::default_host();
+                            let device = match host.default_input_device() {
+                                Some(d) => d,
+                                None => {
+                                    let _ =
+                                        reply.send(Err("no input device available".to_string()));
+                                    continue;
+                                }
+                            };
+                            let config = match device.default_input_config() {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    let _ = reply.send(Err(format!("input config: {e}")));
+                                    continue;
+                                }
+                            };
+
+                            let channels = config.channels() as usize;
+                            let device_rate = config.sample_rate() as f64;
+                            let sample_format = config.sample_format();
+                            let stride =
+                                (device_rate / TARGET_SAMPLE_RATE as f64).max(1.0) as usize;
+
+                            let push = move |mono: Vec<i16>| {
+                                if !listening.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                let mut buf = buffer.lock().unwrap();
+                                if stride == 1 {
+                                    buf.extend_from_slice(&mono);
+                                } else {
+                                    for chunk in mono.chunks(stride) {
+                                        let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+                                        buf.push((sum / chunk.len() as i32) as i16);
+                                    }
+                                }
+                            };
+
+                            let stream_config: cpal::StreamConfig = config.clone().into();
+                            let err_fn =
+                                |err| eprintln!("[tauri-plugin-stt] audio stream error: {err}");
+
+                            let built_stream = match sample_format {
+                                cpal::SampleFormat::F32 => {
+                                    let push = push.clone();
+                                    device.build_input_stream(
+                                        &stream_config,
+                                        move |data: &[f32], _| {
+                                            let mono = downmix_f32(data, channels);
+                                            push(mono);
+                                        },
+                                        err_fn,
+                                        None,
+                                    )
+                                }
+                                cpal::SampleFormat::I16 => {
+                                    let push = push.clone();
+                                    device.build_input_stream(
+                                        &stream_config,
+                                        move |data: &[i16], _| {
+                                            let mono = downmix_i16(data, channels);
+                                            push(mono);
+                                        },
+                                        err_fn,
+                                        None,
+                                    )
+                                }
+                                cpal::SampleFormat::U16 => {
+                                    let push = push.clone();
+                                    device.build_input_stream(
+                                        &stream_config,
+                                        move |data: &[u16], _| {
+                                            let mono = downmix_u16(data, channels);
+                                            push(mono);
+                                        },
+                                        err_fn,
+                                        None,
+                                    )
+                                }
+                                other => {
+                                    let _ = reply
+                                        .send(Err(format!("unsupported sample format: {other:?}")));
+                                    continue;
+                                }
+                            };
+
+                            let stream_obj = match built_stream {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let _ = reply.send(Err(format!("build input stream: {e}")));
+                                    continue;
+                                }
+                            };
+
+                            if let Err(e) = stream_obj.play() {
+                                let _ = reply.send(Err(format!("play stream: {e}")));
+                                continue;
+                            }
+
+                            stream = Some(stream_obj);
+                            let _ = reply.send(Ok(()));
+                        }
+                        AudioControl::Stop => {
+                            stream = None;
+                        }
+                    }
+                }
+                let _ = stream;
+            });
+        }
+
+        if state.stream_alive {
+            return Ok(());
+        }
+
+        let buffer = state.buffer.clone();
+        let listening = state.listening.clone();
+        let audio_sender = state.audio_sender.clone().unwrap();
+        drop(state);
+
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        audio_sender
+            .send(AudioControl::Start {
+                buffer,
+                listening,
+                reply: reply_tx,
+            })
+            .map_err(|e| crate::Error::Recording(format!("failed to send start command: {e}")))?;
+
+        match reply_rx.recv() {
+            Ok(Ok(())) => {
+                let mut state = self.state.lock().unwrap();
+                state.stream_alive = true;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(crate::Error::Recording(e)),
+            Err(e) => Err(crate::Error::Recording(format!(
+                "failed to receive start reply: {e}"
+            ))),
+        }
     }
 
     /// Runs Whisper over the captured buffer and emits the final
@@ -723,7 +781,15 @@ impl<R: Runtime> Stt<R> {
         let app = self.app.clone();
         let state = self.state.clone();
 
+        {
+            let mut s = state.lock().unwrap();
+            s.transcribing = true;
+        }
+
         thread::spawn(move || {
+            let _guard = TranscribeGuard {
+                state: state.clone(),
+            };
             // Re-fetch the context inside the worker to keep the lock
             // duration short on the main path. If load fails we surface
             // it via the standard error event.
@@ -982,6 +1048,13 @@ impl<R: Runtime> Stt<R> {
                 }
                 if listening_flag.load(Ordering::Relaxed) {
                     if let Ok(samples) = drain_and_stop(&state) {
+                        {
+                            let mut s = state.lock().unwrap();
+                            if let Some(sender) = &s.audio_sender {
+                                let _ = sender.send(AudioControl::Stop);
+                            }
+                            s.stream_alive = false;
+                        }
                         let stt = Stt {
                             app: app.clone(),
                             state: state.clone(),
@@ -1005,6 +1078,13 @@ impl<R: Runtime> Stt<R> {
 
     pub fn stop_listening(&self) -> crate::Result<()> {
         let samples = drain_and_stop(&self.state)?;
+        {
+            let mut state = self.state.lock().unwrap();
+            if let Some(sender) = &state.audio_sender {
+                let _ = sender.send(AudioControl::Stop);
+            }
+            state.stream_alive = false;
+        }
         let language = self.state.lock().unwrap().language.clone();
         let _ = self.app.emit(
             "plugin:stt:stateChange",
@@ -1081,6 +1161,11 @@ impl<R: Runtime> Stt<R> {
     pub fn request_permission(&self) -> crate::Result<PermissionResponse> {
         self.check_permission()
     }
+
+    pub fn unload_model(&self) -> crate::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.unload_model()
+    }
 }
 
 fn drain_and_stop(state: &Arc<Mutex<SttState>>) -> crate::Result<Vec<i16>> {
@@ -1148,4 +1233,109 @@ fn downmix_u16(data: &[u16], channels: usize) -> Vec<i16> {
             (avg - 32_768) as i16
         })
         .collect()
+}
+
+impl SttState {
+    fn unload_model(&mut self) -> crate::Result<()> {
+        if self.listening.load(Ordering::SeqCst) {
+            return Err(crate::Error::Recording(
+                "cannot unload model while recording is active".into(),
+            ));
+        }
+        if self.transcribing {
+            return Err(crate::Error::Recording(
+                "cannot unload model while transcription is active".into(),
+            ));
+        }
+        self.context = None;
+        self.loaded_model = None;
+        Ok(())
+    }
+}
+
+struct TranscribeGuard {
+    state: Arc<Mutex<SttState>>,
+}
+
+impl Drop for TranscribeGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.transcribing = false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audio_control_channel_and_state() {
+        let (tx, rx) = std::sync::mpsc::channel::<AudioControl>();
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let listening = Arc::new(AtomicBool::new(false));
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            if let Ok(msg) = rx.recv() {
+                match msg {
+                    AudioControl::Start {
+                        buffer: _,
+                        listening: _,
+                        reply,
+                    } => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    AudioControl::Stop => {}
+                }
+            }
+        });
+
+        tx.send(AudioControl::Start {
+            buffer: buffer.clone(),
+            listening: listening.clone(),
+            reply: reply_tx,
+        })
+        .unwrap();
+
+        let res = reply_rx.recv().unwrap();
+        assert!(res.is_ok());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_unload_model_prevention() {
+        let mut state = SttState {
+            context: None,
+            loaded_model: None,
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            listening: Arc::new(AtomicBool::new(false)),
+            transcribing: false,
+            stream_alive: false,
+            audio_sender: None,
+            max_duration_ms: None,
+            started_at: None,
+            language: None,
+        };
+
+        // 1. Success initially (no model loaded, but not active)
+        assert!(state.unload_model().is_ok());
+
+        // 2. Fails when listening is true
+        state.listening.store(true, Ordering::SeqCst);
+        let err1 = state.unload_model().unwrap_err();
+        assert!(matches!(err1, crate::Error::Recording(_)));
+
+        // Reset listening
+        state.listening.store(false, Ordering::SeqCst);
+
+        // 3. Fails when transcribing is true
+        state.transcribing = true;
+        let err2 = state.unload_model().unwrap_err();
+        assert!(matches!(err2, crate::Error::Recording(_)));
+
+        // Reset transcribing
+        state.transcribing = false;
+        assert!(state.unload_model().is_ok());
+    }
 }

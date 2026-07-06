@@ -16,6 +16,7 @@ Default permissions for the STT plugin - allows all speech-to-text operations
 - `allow-install-model`
 - `allow-remove-model`
 - `allow-set-active-model`
+- `allow-unload-model`
 
 ## Permission Table
 
@@ -48,58 +49,6 @@ Enables the check_permission command without any pre-configured scope.
 <td>
 
 Denies the check_permission command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`stt:allow-check-permission`
-
-</td>
-<td>
-
-Enables the check_permission command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`stt:deny-check-permission`
-
-</td>
-<td>
-
-Denies the check_permission command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`stt:allow-get-supported-languages`
-
-</td>
-<td>
-
-Enables the get_supported_languages command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`stt:deny-get-supported-languages`
-
-</td>
-<td>
-
-Denies the get_supported_languages command without any pre-configured scope.
 
 </td>
 </tr>
@@ -152,32 +101,6 @@ Enables the install_model command without any pre-configured scope.
 <td>
 
 Denies the install_model command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`stt:allow-is-available`
-
-</td>
-<td>
-
-Enables the is_available command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`stt:deny-is-available`
-
-</td>
-<td>
-
-Denies the is_available command without any pre-configured scope.
 
 </td>
 </tr>
@@ -341,32 +264,6 @@ Denies the request_permission command without any pre-configured scope.
 <tr>
 <td>
 
-`stt:allow-request-permission`
-
-</td>
-<td>
-
-Enables the request_permission command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`stt:deny-request-permission`
-
-</td>
-<td>
-
-Denies the request_permission command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
 `stt:allow-set-active-model`
 
 </td>
@@ -419,32 +316,6 @@ Denies the start_listening command without any pre-configured scope.
 <tr>
 <td>
 
-`stt:allow-start-listening`
-
-</td>
-<td>
-
-Enables the start_listening command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`stt:deny-start-listening`
-
-</td>
-<td>
-
-Denies the start_listening command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
 `stt:allow-stop-listening`
 
 </td>
@@ -471,12 +342,12 @@ Denies the stop_listening command without any pre-configured scope.
 <tr>
 <td>
 
-`stt:allow-stop-listening`
+`stt:allow-unload-model`
 
 </td>
 <td>
 
-Enables the stop_listening command without any pre-configured scope.
+Enables the unload_model command without any pre-configured scope.
 
 </td>
 </tr>
@@ -484,12 +355,12 @@ Enables the stop_listening command without any pre-configured scope.
 <tr>
 <td>
 
-`stt:deny-stop-listening`
+`stt:deny-unload-model`
 
 </td>
 <td>
 
-Denies the stop_listening command without any pre-configured scope.
+Denies the unload_model command without any pre-configured scope.
 
 </td>
 </tr>

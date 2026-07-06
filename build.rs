@@ -5,10 +5,13 @@ const COMMANDS: &[&str] = &[
     "get_supported_languages",
     "check_permission",
     "request_permission",
+    "register_listener",
+    "remove_listener",
     "list_models",
     "install_model",
     "remove_model",
     "set_active_model",
+    "unload_model",
 ];
 
 fn main() {
