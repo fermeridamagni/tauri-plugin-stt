@@ -71,6 +71,7 @@ Files are fetched from HuggingFace (`ggerganov/whisper.cpp`) and stored under `<
 - `install_model(id)` — downloads and emits `stt://download-progress` events
 - `remove_model(id)` — deletes file; clears active marker if needed
 - `set_active_model(id)` — sets which installed model `start_listening` loads
+- `unload_model()` — drops the loaded Whisper context from memory; fails while listening or transcribing
 - `start_listening({ language?, max_duration? })` — begins a push-to-talk session
 - `stop_listening()` — runs Whisper over captured audio and emits a final result
 - `is_available()` — `true` only when a model is installed and ready
@@ -81,8 +82,8 @@ Files are fetched from HuggingFace (`ggerganov/whisper.cpp`) and stored under `<
 
 - `stt://download-progress` — `{ status, modelId, model, progress, downloaded?, total? }`
 - `stt://result` — `{ transcript, isFinal, confidence }`
-- `stt://error` — `{ code, message }`
-- `plugin:stt:stateChange` — `{ state, isAvailable, language }`
+- `stt://error` / `plugin:stt:error` — `{ code, message, details? }` (codes follow the `SttErrorCode` union, e.g. `NO_SPEECH`, `AUDIO_ERROR`)
+- `plugin:stt:stateChange` — `{ state, isAvailable, language }` (`idle` is emitted only after transcription finishes)
 
 ## Behaviour Notes
 
@@ -92,7 +93,7 @@ Files are fetched from HuggingFace (`ggerganov/whisper.cpp`) and stored under `<
 
 ## Mobile
 
-The mobile bridges expose the same JS API surface, but `list_models` returns an empty list and `install_model` / `remove_model` / `set_active_model` are no-ops: the OS engine has no downloadable model concept. Use `is_available` to gate UI — on iOS/Android it reflects actual recogniser availability.
+The mobile bridges expose the same JS API surface, but `list_models` returns an empty list and `install_model` / `remove_model` / `set_active_model` / `unload_model` are no-ops: the OS engine has no downloadable model concept. Use `is_available` to gate UI — on iOS/Android it reflects actual recogniser availability.
 
 ## License
 

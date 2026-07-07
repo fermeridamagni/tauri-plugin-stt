@@ -85,7 +85,11 @@ pub(crate) async fn list_models<R: Runtime>(
 /// installed becomes active automatically.
 #[command]
 pub(crate) async fn install_model<R: Runtime>(app: AppHandle<R>, id: String) -> Result<()> {
-    app.stt().install_model(id)
+    // Downloads take minutes; keep the blocking I/O off the async
+    // runtime so other plugin commands stay responsive meanwhile.
+    tauri::async_runtime::spawn_blocking(move || app.stt().install_model(id))
+        .await
+        .map_err(|e| crate::Error::Recording(format!("install task failed: {e}")))?
 }
 
 /// Delete a previously downloaded Whisper model. Clears the active

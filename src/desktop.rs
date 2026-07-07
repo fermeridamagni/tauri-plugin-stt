@@ -10,6 +10,7 @@
 //! pipeline once and emit a single final result. The resulting UX is
 //! push-to-talk (record → release → transcript in ≈100–500 ms for the
 //! `tiny`/`base` models).
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,10 @@ use crate::models::*;
 
 /// Whisper consumes mono audio at exactly 16 kHz.
 const TARGET_SAMPLE_RATE: u32 = 16_000;
+
+/// Hard cap on captured samples (10 minutes ≈ 19 MB of i16 PCM) so a
+/// forgotten session without `maxDuration` can't grow unbounded.
+const MAX_CAPTURE_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 600;
 
 /// Filename of the small marker that records which installed model is
 /// currently selected as the active recognizer.
@@ -241,17 +246,23 @@ struct SttState {
     /// Already mono, 16-bit PCM, 16 kHz — ready to convert to f32.
     buffer: Arc<Mutex<Vec<i16>>>,
     /// `true` while recording. The cpal callback short-circuits when
-    /// this flips to `false`, so we never drop the stream — we just
-    /// stop appending samples.
+    /// this flips to `false`, so samples stop accumulating even before
+    /// the audio thread drops the stream.
     listening: Arc<AtomicBool>,
-    /// `true` while a background transcription is running in `transcribe_and_emit`.
-    transcribing: bool,
-    /// Live cpal stream. Kept alive for the plugin's lifetime so the
-    /// first `start_listening` can be reused (cpal stream creation is
-    /// expensive and triggers the macOS microphone permission prompt).
+    /// Number of background transcriptions currently running in
+    /// `transcribe_and_emit`. A count (not a bool) because sessions can
+    /// overlap: a new recording may start while the previous worker is
+    /// still transcribing, and each worker clears its own slot.
+    transcribing: usize,
+    /// `true` while the audio thread holds a live cpal stream. The
+    /// stream is dropped on stop (via `AudioControl::Stop`) so the OS
+    /// microphone indicator turns off between sessions.
     stream_alive: bool,
     /// Audio thread control sender.
     audio_sender: Option<std::sync::mpsc::Sender<AudioControl>>,
+    /// Model ids with a download in flight, so concurrent installs of
+    /// the same model can't clobber each other's `.part` file.
+    installing: HashSet<String>,
     /// Optional max-duration (ms) after which we auto-stop. `None`
     /// means "until the caller invokes `stop_listening`".
     max_duration_ms: Option<u64>,
@@ -273,9 +284,10 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
             TARGET_SAMPLE_RATE as usize * 30,
         ))),
         listening: Arc::new(AtomicBool::new(false)),
-        transcribing: false,
+        transcribing: 0,
         stream_alive: false,
         audio_sender: None,
+        installing: HashSet::new(),
         max_duration_ms: None,
         started_at: None,
         language: None,
@@ -426,6 +438,22 @@ impl<R: Runtime> Stt<R> {
         fs::create_dir_all(self.models_dir())
             .map_err(|e| crate::Error::Recording(format!("create models dir: {e}")))?;
 
+        // One download per model at a time — a second concurrent install
+        // of the same id would truncate the `.part` file mid-write.
+        {
+            let mut state = self.state.lock().unwrap();
+            if !state.installing.insert(spec.id.to_string()) {
+                return Err(crate::Error::Recording(format!(
+                    "{} is already downloading",
+                    spec.display_name
+                )));
+            }
+        }
+        let _install_guard = InstallGuard {
+            state: self.state.clone(),
+            id: spec.id.to_string(),
+        };
+
         let _ = self.app.emit(
             "stt://download-progress",
             serde_json::json!({
@@ -442,7 +470,10 @@ impl<R: Runtime> Stt<R> {
         let app_handle = self.app.clone();
         let dest_clone = dest.clone();
 
-        let join = thread::spawn(move || -> Result<(), String> {
+        // Runs inline: the command already executes on a blocking-safe
+        // thread (`spawn_blocking` in commands.rs), so a worker thread
+        // here would add nothing but a join.
+        let download = (move || -> Result<(), String> {
             let client = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(60 * 60))
                 .build()
@@ -499,25 +530,19 @@ impl<R: Runtime> Stt<R> {
                 format!("rename {} -> {}: {e}", tmp.display(), dest_clone.display())
             })?;
             Ok(())
-        });
+        })();
 
-        match join.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(msg)) => {
-                let _ = self.app.emit(
-                    "stt://download-progress",
-                    serde_json::json!({
-                        "status": "error",
-                        "modelId": spec.id,
-                        "model": spec.file_name,
-                        "message": &msg,
-                    }),
-                );
-                return Err(crate::Error::Recording(msg));
-            }
-            Err(_) => {
-                return Err(crate::Error::Recording("download thread panicked".into()));
-            }
+        if let Err(msg) = download {
+            let _ = self.app.emit(
+                "stt://download-progress",
+                serde_json::json!({
+                    "status": "error",
+                    "modelId": spec.id,
+                    "model": spec.file_name,
+                    "message": &msg,
+                }),
+            );
+            return Err(crate::Error::Recording(msg));
         }
 
         // Promote the freshly installed model to active when nothing
@@ -659,6 +684,9 @@ impl<R: Runtime> Stt<R> {
                                     return;
                                 }
                                 let mut buf = buffer.lock().unwrap();
+                                if buf.len() >= MAX_CAPTURE_SAMPLES {
+                                    return;
+                                }
                                 if stride == 1 {
                                     buf.extend_from_slice(&mono);
                                 } else {
@@ -783,12 +811,14 @@ impl<R: Runtime> Stt<R> {
 
         {
             let mut s = state.lock().unwrap();
-            s.transcribing = true;
+            s.transcribing += 1;
         }
 
         thread::spawn(move || {
             let _guard = TranscribeGuard {
+                app: app.clone(),
                 state: state.clone(),
+                language: language.clone(),
             };
             // Re-fetch the context inside the worker to keep the lock
             // duration short on the main path. If load fails we surface
@@ -796,12 +826,10 @@ impl<R: Runtime> Stt<R> {
             let ctx = match state.lock().unwrap().context.clone() {
                 Some(ctx) => ctx,
                 None => {
-                    let _ = app.emit(
-                        "stt://error",
-                        serde_json::json!({
-                            "code": "NotAvailable",
-                            "message": "Whisper context not initialised",
-                        }),
+                    emit_error(
+                        &app,
+                        SttErrorCode::NotAvailable,
+                        "Whisper context not initialised".into(),
                     );
                     return;
                 }
@@ -820,6 +848,9 @@ impl<R: Runtime> Stt<R> {
                     .as_millis();
                 std::env::temp_dir().join(format!("stt_recording_{ts}.wav"))
             };
+            // Whatever path the worker exits through — error, panic, or
+            // success after the base64 read — the temp WAV is removed.
+            let _wav_cleanup = RemoveOnDrop(wav_path.clone());
             {
                 let spec = hound::WavSpec {
                     channels: 1,
@@ -830,36 +861,22 @@ impl<R: Runtime> Stt<R> {
                 let mut writer = match hound::WavWriter::create(&wav_path, spec) {
                     Ok(w) => w,
                     Err(e) => {
-                        let _ = app.emit(
-                            "stt://error",
-                            serde_json::json!({
-                                "code": "Recording",
-                                "message": format!("create WAV: {e}"),
-                            }),
-                        );
+                        emit_error(&app, SttErrorCode::AudioError, format!("create WAV: {e}"));
                         return;
                     }
                 };
                 for &s in &samples {
                     if let Err(e) = writer.write_sample(s) {
-                        let _ = app.emit(
-                            "stt://error",
-                            serde_json::json!({
-                                "code": "Recording",
-                                "message": format!("write WAV sample: {e}"),
-                            }),
+                        emit_error(
+                            &app,
+                            SttErrorCode::AudioError,
+                            format!("write WAV sample: {e}"),
                         );
                         return;
                     }
                 }
                 if let Err(e) = writer.finalize() {
-                    let _ = app.emit(
-                        "stt://error",
-                        serde_json::json!({
-                            "code": "Recording",
-                            "message": format!("finalize WAV: {e}"),
-                        }),
-                    );
+                    emit_error(&app, SttErrorCode::AudioError, format!("finalize WAV: {e}"));
                     return;
                 }
             }
@@ -873,14 +890,7 @@ impl<R: Runtime> Stt<R> {
                     .map(|s| s as f32 / i16::MAX as f32)
                     .collect(),
                 Err(e) => {
-                    let _ = app.emit(
-                        "stt://error",
-                        serde_json::json!({
-                            "code": "Recording",
-                            "message": format!("read WAV: {e}"),
-                        }),
-                    );
-                    let _ = fs::remove_file(&wav_path);
+                    emit_error(&app, SttErrorCode::AudioError, format!("read WAV: {e}"));
                     return;
                 }
             };
@@ -888,12 +898,10 @@ impl<R: Runtime> Stt<R> {
             // or silence — bail early instead of triggering a panic
             // inside whisper.cpp.
             if audio.len() < (TARGET_SAMPLE_RATE as usize / 10) {
-                let _ = app.emit(
-                    "stt://error",
-                    serde_json::json!({
-                        "code": "NoSpeech",
-                        "message": "audio buffer too short to transcribe",
-                    }),
+                emit_error(
+                    &app,
+                    SttErrorCode::NoSpeech,
+                    "audio buffer too short to transcribe".into(),
                 );
                 return;
             }
@@ -948,24 +956,20 @@ impl<R: Runtime> Stt<R> {
             let mut whisper_state = match ctx.create_state() {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = app.emit(
-                        "stt://error",
-                        serde_json::json!({
-                            "code": "Recording",
-                            "message": format!("create whisper state: {e}"),
-                        }),
+                    emit_error(
+                        &app,
+                        SttErrorCode::Unknown,
+                        format!("create whisper state: {e}"),
                     );
                     return;
                 }
             };
 
             if let Err(e) = whisper_state.full(params, &audio) {
-                let _ = app.emit(
-                    "stt://error",
-                    serde_json::json!({
-                        "code": "RecognitionFailed",
-                        "message": format!("whisper transcribe: {e}"),
-                    }),
+                emit_error(
+                    &app,
+                    SttErrorCode::Unknown,
+                    format!("whisper transcribe: {e}"),
                 );
                 return;
             }
@@ -983,8 +987,6 @@ impl<R: Runtime> Stt<R> {
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode(&bytes)
             });
-            // Remove the temp file — the base64 copy is now in the event.
-            let _ = fs::remove_file(&wav_path);
 
             let result = RecognitionResult {
                 transcript,
@@ -1055,19 +1057,30 @@ impl<R: Runtime> Stt<R> {
                             }
                             s.stream_alive = false;
                         }
-                        let stt = Stt {
-                            app: app.clone(),
-                            state: state.clone(),
-                        };
-                        stt.transcribe_and_emit(samples, language.clone());
                         let _ = app.emit(
                             "plugin:stt:stateChange",
                             RecognitionStatus {
-                                state: RecognitionState::Idle,
+                                state: RecognitionState::Processing,
                                 is_available: true,
                                 language: language.clone(),
                             },
                         );
+                        if samples.is_empty() {
+                            let _ = app.emit(
+                                "plugin:stt:stateChange",
+                                RecognitionStatus {
+                                    state: RecognitionState::Idle,
+                                    is_available: true,
+                                    language: language.clone(),
+                                },
+                            );
+                        } else {
+                            let stt = Stt {
+                                app: app.clone(),
+                                state: state.clone(),
+                            };
+                            stt.transcribe_and_emit(samples, language.clone());
+                        }
                     }
                 }
             });
@@ -1094,17 +1107,21 @@ impl<R: Runtime> Stt<R> {
                 language: language.clone(),
             },
         );
-        if !samples.is_empty() {
-            self.transcribe_and_emit(samples, language.clone());
+        if samples.is_empty() {
+            // No worker will run, so nothing else can report idle.
+            let _ = self.app.emit(
+                "plugin:stt:stateChange",
+                RecognitionStatus {
+                    state: RecognitionState::Idle,
+                    is_available: true,
+                    language,
+                },
+            );
+        } else {
+            // The worker's `TranscribeGuard` emits idle once Whisper is
+            // actually done — `processing` stays truthful meanwhile.
+            self.transcribe_and_emit(samples, language);
         }
-        let _ = self.app.emit(
-            "plugin:stt:stateChange",
-            RecognitionStatus {
-                state: RecognitionState::Idle,
-                is_available: true,
-                language,
-            },
-        );
         Ok(())
     }
 
@@ -1166,6 +1183,19 @@ impl<R: Runtime> Stt<R> {
         let mut state = self.state.lock().unwrap();
         state.unload_model()
     }
+}
+
+/// Emits a structured error on both channels: the raw `stt://error`
+/// name documented in the README and `plugin:stt:error`, the name the
+/// guest-js bindings subscribe to on desktop.
+fn emit_error<R: Runtime>(app: &AppHandle<R>, code: SttErrorCode, message: String) {
+    let err = SttError {
+        code,
+        message,
+        details: None,
+    };
+    let _ = app.emit("stt://error", &err);
+    let _ = app.emit("plugin:stt:error", &err);
 }
 
 fn drain_and_stop(state: &Arc<Mutex<SttState>>) -> crate::Result<Vec<i16>> {
@@ -1242,7 +1272,7 @@ impl SttState {
                 "cannot unload model while recording is active".into(),
             ));
         }
-        if self.transcribing {
+        if self.transcribing > 0 {
             return Err(crate::Error::Recording(
                 "cannot unload model while transcription is active".into(),
             ));
@@ -1253,14 +1283,51 @@ impl SttState {
     }
 }
 
-struct TranscribeGuard {
+/// Drops with the transcription worker, whatever exit path it takes
+struct TranscribeGuard<R: Runtime> {
+    app: AppHandle<R>,
     state: Arc<Mutex<SttState>>,
+    language: Option<String>,
 }
 
-impl Drop for TranscribeGuard {
+impl<R: Runtime> Drop for TranscribeGuard<R> {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
-            state.transcribing = false;
+            state.transcribing = state.transcribing.saturating_sub(1);
+        }
+        let _ = self.app.emit(
+            "plugin:stt:stateChange",
+            RecognitionStatus {
+                state: RecognitionState::Idle,
+                is_available: true,
+                language: self.language.clone(),
+            },
+        );
+    }
+}
+
+/// Removes the wrapped file when dropped. Keeps the temp-WAV cleanup on
+/// every exit path of the transcription worker without repeating
+/// `fs::remove_file` before each early return.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Releases the `installing` slot for a model id on every exit path of
+/// `install_model`, including download errors and panics.
+struct InstallGuard {
+    state: Arc<Mutex<SttState>>,
+    id: String,
+}
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.installing.remove(&self.id);
         }
     }
 }
@@ -1310,9 +1377,10 @@ mod tests {
             loaded_model: None,
             buffer: Arc::new(Mutex::new(Vec::new())),
             listening: Arc::new(AtomicBool::new(false)),
-            transcribing: false,
+            transcribing: 0,
             stream_alive: false,
             audio_sender: None,
+            installing: HashSet::new(),
             max_duration_ms: None,
             started_at: None,
             language: None,
@@ -1329,13 +1397,17 @@ mod tests {
         // Reset listening
         state.listening.store(false, Ordering::SeqCst);
 
-        // 3. Fails when transcribing is true
-        state.transcribing = true;
+        // 3. Fails while any transcription is running — including when
+        // two sessions overlap and only the first worker has finished.
+        state.transcribing = 2;
         let err2 = state.unload_model().unwrap_err();
         assert!(matches!(err2, crate::Error::Recording(_)));
 
-        // Reset transcribing
-        state.transcribing = false;
+        state.transcribing = 1;
+        let err3 = state.unload_model().unwrap_err();
+        assert!(matches!(err3, crate::Error::Recording(_)));
+
+        state.transcribing = 0;
         assert!(state.unload_model().is_ok());
     }
 }
